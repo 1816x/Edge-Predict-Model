@@ -137,9 +137,12 @@ CREATE TABLE events (
     external_ids   jsonb NOT NULL DEFAULT '{}', -- {"mlb_game_pk": "745123", "the_odds_api_id": "..."}
     created_at     timestamptz NOT NULL DEFAULT now(),
     updated_at     timestamptz NOT NULL DEFAULT now(),
-    CHECK (home_team_id <> away_team_id),
-    -- MLB doubleheaders share teams and date but differ in start time.
-    UNIQUE (sport_id, home_team_id, away_team_id, start_time_utc)
+    CHECK (home_team_id <> away_team_id)
+    -- NO unique on (teams, start_time): traditional MLB doubleheaders list
+    -- two DISTINCT games with identical teams and identical listed start
+    -- times (verified against the 2018 schedule). Event identity lives in
+    -- the external ids (partial unique indexes below) plus the ingestion
+    -- layer's closest-start matching.
 );
 
 -- Final scores per event. Needed to settle picks AND to compute calibration
@@ -347,6 +350,8 @@ CREATE INDEX idx_events_sport_start ON events (sport_id, start_time_utc);
 CREATE INDEX idx_events_status ON events (status) WHERE status IN ('scheduled', 'live');
 CREATE UNIQUE INDEX uq_events_mlb_game_pk
     ON events ((external_ids ->> 'mlb_game_pk')) WHERE external_ids ? 'mlb_game_pk';
+CREATE UNIQUE INDEX uq_events_odds_api_id
+    ON events ((external_ids ->> 'the_odds_api_id')) WHERE external_ids ? 'the_odds_api_id';
 
 -- Prediction lookups (calibration reports, per-event audit).
 CREATE INDEX idx_predictions_event_market ON predictions (event_id, market, created_at DESC);

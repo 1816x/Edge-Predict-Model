@@ -1,0 +1,93 @@
+"""F1 training/evaluation job: walk-forward metrics report (read-only).
+
+Usage::
+
+    python -m app.jobs.train_f1 [--markets moneyline,f5_moneyline] [--min-train-seasons 4]
+
+Loads finished games from the database, builds the as-of team-form dataset,
+trains logistic + gradient-boosting models walk-forward by season with Platt
+calibration, and prints a JSON report plus a readable markdown summary.
+
+HONEST LIMITATION (read before quoting numbers): the hard publication gate
+of docs/04 §2.4 is beating the MARKET PRIOR's log loss, and that needs
+historical odds we do not have yet (free tier; own snapshots started
+2026-07-08). Until then this report only shows whether the models carry
+signal vs naive baselines and whether calibration holds. It does NOT
+authorize publishing picks.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from typing import Any
+
+from app.config import get_settings
+from app.db.engine import make_engine
+from app.ml.dataset import build_training_frame, load_results_frame
+from app.ml.train import walk_forward_report
+
+
+def run(
+    markets: tuple[str, ...] = ("moneyline", "f5_moneyline"),
+    min_train_seasons: int = 4,
+    *,
+    engine=None,
+) -> dict[str, Any]:
+    engine = engine or make_engine(get_settings().database_url)
+    games = load_results_frame(engine)
+    out: dict[str, Any] = {
+        "job": "train_f1",
+        "games_with_results": int(len(games)),
+        "markets": {},
+        "gate_note": (
+            "market_prior baseline unavailable (no historical odds yet); "
+            "docs/04 §2.4 gate NOT evaluated — publishing stays blocked"
+        ),
+    }
+    if len(games) == 0:
+        out["error"] = "no finished games with results; run backfill_results first"
+        return out
+    for market in markets:
+        frame = build_training_frame(games, market)
+        out["markets"][market] = {
+            "rows": int(len(frame)),
+            "seasons": sorted(int(s) for s in frame["season"].unique()),
+            "report": walk_forward_report(frame, min_train_seasons),
+        }
+    return out
+
+
+def _markdown_summary(result: dict[str, Any]) -> str:
+    lines = ["", "## Resumen F1 (walk-forward, calibrado con Platt)", ""]
+    for market, block in result.get("markets", {}).items():
+        lines.append(f"### {market} — {block['rows']} juegos, temporadas {block['seasons']}")
+        lines.append("")
+        lines.append("| Test | n | const LL | home_rate LL | logistic LL | hist_gb LL | logistic ECE | hist_gb ECE |")
+        lines.append("|---|---|---|---|---|---|---|---|")
+        for season, rep in sorted(block["report"]["seasons"].items()):
+            lines.append(
+                f"| {season} | {rep['logistic']['calibrated']['n']} "
+                f"| {rep['baseline_constant']['log_loss']} "
+                f"| {rep['baseline_home_rate']['log_loss']} "
+                f"| {rep['logistic']['calibrated']['log_loss']} "
+                f"| {rep['hist_gb']['calibrated']['log_loss']} "
+                f"| {rep['logistic']['calibrated']['ece']} "
+                f"| {rep['hist_gb']['calibrated']['ece']} |"
+            )
+        lines.append("")
+    lines.append(f"> {result['gate_note']}")
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--markets", default="moneyline,f5_moneyline")
+    parser.add_argument("--min-train-seasons", type=int, default=4)
+    args = parser.parse_args()
+    result = run(
+        markets=tuple(m.strip() for m in args.markets.split(",") if m.strip()),
+        min_train_seasons=args.min_train_seasons,
+    )
+    print(json.dumps(result))
+    print(_markdown_summary(result))

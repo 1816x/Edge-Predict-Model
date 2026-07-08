@@ -100,6 +100,59 @@ def test_backfill_chunking_covers_range_without_overlap(db):
     ]
 
 
+@pytest.mark.integration
+def test_traditional_doubleheader_same_listed_start(db):
+    """Two DISTINCT gamePks, same teams, IDENTICAL listed start time (as in
+    the real 2018 schedule) must yield two events with their own identities —
+    the constraint/merge bug the first production backfill exposed."""
+    from datetime import datetime, timezone
+
+    from app.ingestion import store
+    from app.ingestion.parsers import ScheduledGame
+
+    start = datetime(2018, 6, 18, 21, 5, tzinfo=timezone.utc)
+
+    def game(pk):
+        return ScheduledGame(
+            game_pk=pk, start_time=start, status="final",
+            home_name="Chicago Cubs", away_name="St. Louis Cardinals",
+            home_mlb_id=112, away_mlb_id=138,
+            home_probable=None, away_probable=None,
+        )
+
+    tables = store.reflect_tables(db)
+    with db.begin() as conn:
+        sport_id = store.get_sport_id(conn, tables)
+        id1, created1 = store.upsert_event_from_schedule(conn, tables, sport_id, game(530769))
+        id2, created2 = store.upsert_event_from_schedule(conn, tables, sport_id, game(530770))
+        # Re-run both: identities must stay put.
+        id1b, _ = store.upsert_event_from_schedule(conn, tables, sport_id, game(530769))
+        id2b, _ = store.upsert_event_from_schedule(conn, tables, sport_id, game(530770))
+
+    assert created1 and created2
+    assert id1 != id2
+    assert (id1b, id2b) == (id1, id2)
+    with db.connect() as conn:
+        pks = conn.execute(
+            text("SELECT external_ids ->> 'mlb_game_pk' FROM events ORDER BY 1")
+        ).scalars().all()
+        assert pks == ["530769", "530770"]
+
+
+@pytest.mark.integration
+def test_migration_001_is_idempotent(db):
+    """The deployed-DB migration must run cleanly even on a fresh schema
+    that already ships the final shape."""
+    from pathlib import Path
+
+    from app.jobs import apply_migration
+
+    migration = Path(__file__).parents[3] / "infra" / "migrations" / "001-events-identity-doubleheaders.sql"
+    first = apply_migration.run(str(migration), engine=db)
+    second = apply_migration.run(str(migration), engine=db)
+    assert first["statements"] == second["statements"] == 2
+
+
 def test_backfill_rejects_inverted_range():
     with pytest.raises(ValueError, match="before start_date"):
         backfill_results.run(
