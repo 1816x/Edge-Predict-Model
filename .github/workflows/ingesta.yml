@@ -43,8 +43,11 @@ on:
         type: string
         default: ''
 
+# Grupos separados: los crons programados nunca desplazan de la cola a un
+# backfill/entrenamiento manual (los jobs son idempotentes y tocan tablas
+# distintas, correr en paralelo es seguro).
 concurrency:
-  group: ingesta
+  group: ingesta-${{ github.event_name }}
   cancel-in-progress: false
 
 permissions:
@@ -53,7 +56,9 @@ permissions:
 jobs:
   ingesta:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Los backfills multi-temporada contra Postgres remoto pueden tardar;
+    # los crons normales terminan en <1 min igualmente.
+    timeout-minutes: 60
     env:
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
