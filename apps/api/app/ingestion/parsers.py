@@ -133,6 +133,9 @@ class ScheduledGame:
     away_mlb_id: int | None
     home_probable: str | None
     away_probable: str | None
+    # MLB gameType: 'R' regular season, 'S' spring training, 'E' exhibition,
+    # 'F'/'D'/'L'/'W' postseason rounds, 'A' all-star. None if absent.
+    game_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -228,6 +231,7 @@ def parse_schedule(payload: dict[str, Any]) -> list[ScheduledGame]:
                     away_mlb_id=away["team"].get("id"),
                     home_probable=(home.get("probablePitcher") or {}).get("fullName"),
                     away_probable=(away.get("probablePitcher") or {}).get("fullName"),
+                    game_type=game.get("gameType"),
                 )
             )
     return games
