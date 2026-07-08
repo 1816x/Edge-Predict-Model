@@ -16,6 +16,25 @@ posterior a estas decisiones debe registrarse aquí con fecha y razón.
 | 9 | Stack | **Python (FastAPI, XGBoost/sklearn, Postgres) + Next.js para el dashboard** | El ecosistema de datos deportivos vive en Python; el front SaaS en Next.js. |
 | 10 | Automatización | **Scan diario automático del slate + análisis bajo demanda** | Cron que evalúa todos los juegos del día y publica value bets; endpoint para analizar un partido/mercado puntual. |
 
+## Addenda (2026-07-08, post-autoría y verificación)
+
+- **Default operativo del cap de stake: 2%** (borde superior del rango elegido en la decisión #8),
+  configurable por usuario con recomendación 1–2%. Así lo implementan `apps/api` (`stake_cap_pct=0.02`),
+  `apps/web` (form de bankroll) y el ejemplo maestro de `05-motor-ev-y-bankroll.md`. Los ejemplos que
+  usan 1% están marcados como ilustrativos.
+- **Riesgo legal identificado — MLB Stats API**: el copyright de MLBAM restringe su uso a
+  individual/no comercial/no masivo. Como el producto es SaaS (decisión #2), esta fuente "gratis"
+  debe resolverse (licencia o proveedor alternativo) como parte de la revisión legal de la fase F3,
+  **antes de cobrar suscripciones**. Detalle en `02-fuentes-de-datos.md`.
+- **Paper trading vs calendario MLB**: la ventana de F2 puede chocar con el fin de la temporada
+  regular (~oct 2026). El gate de salida de F2 es el **sample** (≥300 picks), no la fecha; si la
+  temporada termina antes, se extiende a 2027 o se complementa con el siguiente deporte de F5.
+  Detalle en `07-roadmap.md`.
+- **Referencia F5 "a confirmar"**: no está confirmado que Pinnacle cotice `h2h_1st_5_innings` vía
+  The Odds API (los additional markets son mayormente de books US). Si no lo cotiza, la línea de
+  referencia no-vig para F5 será el consenso de books US. Paso de verificación concreto en
+  `02-fuentes-de-datos.md`.
+
 ## Principios no negociables (del brief original)
 
 - No se promete rentabilidad. El producto vende claridad, control de riesgo y trazabilidad.
