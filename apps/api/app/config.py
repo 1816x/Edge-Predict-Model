@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     # LLM research/explanation layer key. The LLM never produces probabilities.
     llm_api_key: str = ""
 
+    # Also snapshot the F5 moneyline (one extra API call PER EVENT: ~30
+    # credits per full-slate run). Set ODDS_INCLUDE_F5=false while on the
+    # free 500-credit tier; the 20K plan absorbs it (docs/02 credit plan).
+    odds_include_f5: bool = True
+
     # --- Pick publication thresholds (MVP defaults, tunable) ----------------
     # Publish a pick only if edge >= edge_threshold AND ev >= ev_threshold
     # (and, once the model exists, ECE <= ece_threshold on a rolling window).

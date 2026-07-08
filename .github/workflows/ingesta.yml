@@ -55,10 +55,16 @@ jobs:
     env:
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      # Repo Variable (Settings -> Secrets and variables -> Actions -> Variables).
+      # En el free tier de The Odds API crear ODDS_INCLUDE_F5=false: el F5 usa
+      # el endpoint por-evento (~2 creditos por juego por corrida) y el tier
+      # gratis de 500 no alcanza. Con el plan 20K, borrar la variable o
+      # ponerla en true.
+      ODDS_INCLUDE_F5: ${{ vars.ODDS_INCLUDE_F5 || 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 

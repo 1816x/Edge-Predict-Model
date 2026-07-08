@@ -20,17 +20,21 @@ class TestParseOddsEvent:
 
     def test_market_mapping_and_counts(self):
         ev = self._event()
-        # pinnacle h2h (2) + pinnacle F5 (2, Draw dropped) + fanduel h2h (2);
-        # fanduel spreads is not an MVP market.
-        assert len(ev.outcomes) == 6
-        markets = {o.market for o in ev.outcomes}
-        assert markets == {"moneyline", "f5_moneyline"}
-        assert not any(o.market == "spreads" for o in ev.outcomes)
-
-    def test_draw_and_unknown_market_are_skipped_and_reported(self):
-        ev = self._event()
-        assert "pinnacle:f5_moneyline:outcome:Draw" in ev.skipped
+        # pinnacle h2h (2) + fanduel h2h (2); fanduel spreads is not an MVP
+        # market. The F5 market never appears slate-wide (additional market).
+        assert len(ev.outcomes) == 4
+        assert {o.market for o in ev.outcomes} == {"moneyline"}
         assert "fanduel:market:spreads" in ev.skipped
+
+    def test_per_event_f5_payload_parses_with_draw_skipped(self):
+        # Same parser handles the per-event endpoint's single-event shape.
+        ev = parse_odds_event(load_fixture("odds_api_event_f5.json"))
+        assert ev.source_id == "e912aa27b1c4f03d8e5a6b7c8d9e0f1a"
+        assert len(ev.outcomes) == 2
+        assert {o.market for o in ev.outcomes} == {"f5_moneyline"}
+        assert "pinnacle:f5_moneyline:outcome:Draw" in ev.skipped
+        f5 = ev.outcomes[0]
+        assert f5.last_update == datetime(2026, 7, 8, 17, 58, 41, tzinfo=timezone.utc)
 
     def test_sides_resolved_from_team_names(self):
         ev = self._event()
@@ -46,11 +50,6 @@ class TestParseOddsEvent:
         assert by_key[("pinnacle", "moneyline", "home")].price_american == 105
         assert by_key[("pinnacle", "moneyline", "away")].price_american == -116
         assert by_key[("fanduel", "moneyline", "home")].price_american == 110
-
-    def test_last_update_parsed_per_market(self):
-        ev = self._event()
-        f5 = next(o for o in ev.outcomes if o.market == "f5_moneyline")
-        assert f5.last_update == datetime(2026, 7, 8, 17, 58, 41, tzinfo=timezone.utc)
 
     def test_junk_price_is_skipped(self):
         payload = load_fixture("odds_api_mlb.json")[1]

@@ -27,8 +27,21 @@ class FakeMlbClient:
 
 
 class FakeOddsClient:
+    """Slate fixture (h2h only) + per-event F5 for event A, mirroring how
+    The Odds API splits featured vs additional markets across endpoints."""
+
     def get_mlb_odds(self, **kwargs):
         return load_fixture("odds_api_mlb.json")
+
+    def get_event_odds(self, event_id, **kwargs):
+        f5 = load_fixture("odds_api_event_f5.json")
+        if event_id == f5["id"]:
+            return f5
+        # Books without the market simply don't appear in the response.
+        for event in load_fixture("odds_api_mlb.json"):
+            if event["id"] == event_id:
+                return {**event, "bookmakers": []}
+        raise AssertionError(f"unexpected event id {event_id}")
 
 
 def _scalar(engine, sql: str, **params):
@@ -68,8 +81,15 @@ def test_snapshot_odds_matches_schedule_and_creates_unknown(db):
     assert summary["events_matched"] == 2
     assert summary["events_created"] == 1
     assert summary["events_started_skipped"] == 0
-    # 6 valid outcomes for event A + 2 (Dodgers game) + 2 (Cardinals game).
+    # Event A: 4 moneyline (pinnacle + fanduel) + 2 F5 via per-event call;
+    # Dodgers and Cardinals games: 2 moneyline each, no F5 quoted.
     assert summary["snapshots_inserted"] == 10
+    assert summary["f5_events_fetched"] == 3
+    assert summary["f5_errors"] == []
+    f5_rows = _scalar(
+        db, "SELECT count(*) FROM odds_snapshots WHERE market = 'f5_moneyline'"
+    )
+    assert f5_rows == 2
     assert _scalar(db, "SELECT count(*) FROM events") == 4
 
     # The matched event now carries BOTH external identities.
@@ -117,6 +137,32 @@ def test_snapshot_odds_matches_schedule_and_creates_unknown(db):
     rerun = snapshot_odds.run(client=FakeOddsClient(), engine=db, captured_at=CAPTURE_TS)
     assert rerun["snapshots_inserted"] == 0
     assert _scalar(db, "SELECT count(*) FROM odds_snapshots") == 10
+
+
+def test_no_f5_skips_per_event_calls(db):
+    class NoF5Client(FakeOddsClient):
+        def get_event_odds(self, event_id, **kwargs):
+            raise AssertionError("per-event endpoint must not be called with include_f5=False")
+
+    summary = snapshot_odds.run(
+        include_f5=False, client=NoF5Client(), engine=db, captured_at=CAPTURE_TS
+    )
+    assert summary["snapshots_inserted"] == 8  # moneyline only
+    assert summary["f5_events_fetched"] == 0
+
+
+def test_f5_failure_never_kills_the_moneyline_rows(db):
+    from app.ingestion.odds_client import OddsApiError
+
+    class FlakyF5Client(FakeOddsClient):
+        def get_event_odds(self, event_id, **kwargs):
+            raise OddsApiError("simulated 500")
+
+    summary = snapshot_odds.run(
+        client=FlakyF5Client(), engine=db, captured_at=CAPTURE_TS
+    )
+    assert summary["snapshots_inserted"] == 8  # all moneyline rows landed
+    assert len(summary["f5_errors"]) == 3
 
 
 def test_closing_flag_only_within_window_and_never_duplicated(db):

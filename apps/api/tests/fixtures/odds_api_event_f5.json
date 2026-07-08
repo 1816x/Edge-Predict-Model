@@ -1,0 +1,26 @@
+{
+  "id": "e912aa27b1c4f03d8e5a6b7c8d9e0f1a",
+  "sport_key": "baseball_mlb",
+  "sport_title": "MLB",
+  "commence_time": "2026-07-08T23:10:00Z",
+  "home_team": "Boston Red Sox",
+  "away_team": "New York Yankees",
+  "bookmakers": [
+    {
+      "key": "pinnacle",
+      "title": "Pinnacle",
+      "last_update": "2026-07-08T17:58:41Z",
+      "markets": [
+        {
+          "key": "h2h_1st_5_innings",
+          "last_update": "2026-07-08T17:58:41Z",
+          "outcomes": [
+            { "name": "Boston Red Sox", "price": 2.62 },
+            { "name": "New York Yankees", "price": 2.14 },
+            { "name": "Draw", "price": 4.9 }
+          ]
+        }
+      ]
+    }
+  ]
+}
