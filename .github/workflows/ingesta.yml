@@ -36,6 +36,8 @@ on:
           - snapshot_odds
           - snapshot_odds_closing
           - backfill_results
+          - train_f1
+          - apply_migration
       args:
         description: 'Args extra (ej. --start-date 2024-03-20 --end-date 2024-10-01)'
         type: string
@@ -85,6 +87,8 @@ jobs:
               snapshot_odds)         python -m app.jobs.snapshot_odds $INPUT_ARGS ;;
               snapshot_odds_closing) python -m app.jobs.snapshot_odds --closing-window-min 30 $INPUT_ARGS ;;
               backfill_results)      python -m app.jobs.backfill_results $INPUT_ARGS ;;
+              train_f1)              pip install --quiet "./apps/api[ml]" && python -m app.jobs.train_f1 $INPUT_ARGS ;;
+              apply_migration)       python -m app.jobs.apply_migration $INPUT_ARGS ;;
               *) echo "job desconocido: $INPUT_JOB" >&2; exit 1 ;;
             esac
           elif [ "$SCHEDULE" = "0 14 * * *" ]; then

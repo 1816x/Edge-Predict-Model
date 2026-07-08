@@ -103,8 +103,16 @@ def _find_event_by_teams(
     home_team_id: uuid.UUID,
     away_team_id: uuid.UUID,
     start_time: datetime,
+    lacking_external_key: str,
 ) -> Row | None:
-    """Closest-start match within EVENT_MATCH_WINDOW for the same team pair."""
+    """Closest-start match within EVENT_MATCH_WINDOW for the same team pair.
+
+    Only events that do NOT yet carry ``lacking_external_key`` are eligible:
+    an event that already owns an identity from the same feed is a DIFFERENT
+    game (traditional doubleheaders list two games with identical teams and
+    even identical start times), and merging would clobber its identity —
+    the exact bug the 2018 backfill exposed.
+    """
     events = t["events"]
     seconds_off = func.abs(func.extract("epoch", events.c.start_time_utc - start_time))
     return conn.execute(
@@ -113,6 +121,7 @@ def _find_event_by_teams(
             events.c.sport_id == sport_id,
             events.c.home_team_id == home_team_id,
             events.c.away_team_id == away_team_id,
+            ~events.c.external_ids.has_key(lacking_external_key),
             seconds_off <= EVENT_MATCH_WINDOW.total_seconds(),
         )
         .order_by(seconds_off)
@@ -142,7 +151,9 @@ def upsert_event_from_schedule(
         )
         return row.id, False
 
-    match = _find_event_by_teams(conn, t, sport_id, home_id, away_id, game.start_time)
+    match = _find_event_by_teams(
+        conn, t, sport_id, home_id, away_id, game.start_time, "mlb_game_pk"
+    )
     if match is not None:
         # Event first seen by the odds job; attach the MLB identity to it.
         conn.execute(
@@ -187,7 +198,9 @@ def find_or_create_event_for_odds(
     home_id = get_or_create_team(conn, t, sport_id, ev.home_team)
     away_id = get_or_create_team(conn, t, sport_id, ev.away_team)
 
-    match = _find_event_by_teams(conn, t, sport_id, home_id, away_id, ev.commence_time)
+    match = _find_event_by_teams(
+        conn, t, sport_id, home_id, away_id, ev.commence_time, "the_odds_api_id"
+    )
     if match is not None:
         conn.execute(
             update(events)
