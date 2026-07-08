@@ -61,7 +61,18 @@ python -m app.jobs.snapshot_odds
 
 # cerca del primer pitch: flaggear la closing line
 python -m app.jobs.snapshot_odds --closing-window-min 20
+
+# backfill histórico de resultados + scores F5 (MLB Stats API, gratis)
+python -m app.jobs.backfill_results --start-date 2024-03-20 --end-date 2024-10-01
 ```
+
+Hay un workflow de GitHub Actions (`.github/workflows/ingesta.yml`) que calendariza
+estos jobs; solo requiere los secrets `ODDS_API_KEY` y `DATABASE_URL` en el repo.
+
+El feature builder as-of (`app/features/builder.py`) construye los bloques de forma
+de equipo de `docs/04` desde este archivo de eventos/resultados, con guardia dura
+anti-leakage (rechaza `as_of_ts` posterior al inicio del juego) y snapshots
+deduplicados por hash canónico en `feature_snapshots`.
 
 Cadencia recomendada (plan de créditos en `docs/02-fuentes-de-datos.md`): schedule una
 vez por la mañana; odds cada 2-4 h + una corrida cercana al inicio de cada juego con

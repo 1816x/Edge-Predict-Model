@@ -135,6 +135,71 @@ class ScheduledGame:
     away_probable: str | None
 
 
+@dataclass(frozen=True)
+class GameResult:
+    """Final score of a game, with First-5-Innings partials when derivable.
+
+    F5 scores are the sum of runs in innings 1-5 from the linescore. They are
+    None unless BOTH sides have runs recorded for all of the first five
+    innings — rain-shortened or oddly-terminated games settle manually rather
+    than with a silently wrong number (docs/06, honest settlement).
+    """
+
+    game_pk: int
+    home_score: int
+    away_score: int
+    f5_home_score: int | None
+    f5_away_score: int | None
+
+
+def _f5_sums(linescore: dict[str, Any]) -> tuple[int | None, int | None]:
+    innings = linescore.get("innings", [])
+    if len(innings) < 5:
+        return None, None
+    home_runs: list[int] = []
+    away_runs: list[int] = []
+    for inning in innings[:5]:
+        home = (inning.get("home") or {}).get("runs")
+        away = (inning.get("away") or {}).get("runs")
+        if home is None or away is None:
+            return None, None
+        home_runs.append(int(home))
+        away_runs.append(int(away))
+    return sum(home_runs), sum(away_runs)
+
+
+def parse_schedule_results(payload: dict[str, Any]) -> list[GameResult]:
+    """Extract final scores from ``GET /api/v1/schedule?hydrate=linescore``.
+
+    Only games whose ``abstractGameState`` is ``Final`` AND that carry both
+    team scores are returned; postponed/cancelled/suspended games are the
+    schedule sync's problem, not the results backfill's.
+    """
+    results: list[GameResult] = []
+    for day in payload.get("dates", []):
+        for game in day.get("games", []):
+            status_obj = game.get("status", {})
+            if status_obj.get("abstractGameState") != "Final":
+                continue
+            if status_obj.get("detailedState") in ("Postponed", "Cancelled"):
+                continue
+            home = game["teams"]["home"]
+            away = game["teams"]["away"]
+            if home.get("score") is None or away.get("score") is None:
+                continue
+            f5_home, f5_away = _f5_sums(game.get("linescore") or {})
+            results.append(
+                GameResult(
+                    game_pk=int(game["gamePk"]),
+                    home_score=int(home["score"]),
+                    away_score=int(away["score"]),
+                    f5_home_score=f5_home,
+                    f5_away_score=f5_away,
+                )
+            )
+    return results
+
+
 def parse_schedule(payload: dict[str, Any]) -> list[ScheduledGame]:
     """Normalize ``GET /api/v1/schedule?hydrate=probablePitcher`` output."""
     games: list[ScheduledGame] = []

@@ -63,6 +63,32 @@ class MlbClient:
                 raise MlbApiError(f"MLB Stats API returned {resp.status_code}: {resp.text[:500]}")
             return resp.json()
 
+    def get_schedule_range(
+        self, start_date: str, end_date: str, hydrate: str = "linescore"
+    ) -> dict[str, Any]:
+        """Schedule for a date range, hydrated with linescores.
+
+        Calls ``GET /api/v1/schedule?sportId=1&startDate=...&endDate=...&hydrate=linescore``.
+        Used by the historical results backfill: one call per date chunk
+        returns every game with its final score and inning-by-inning runs
+        (which yield the First-5-Innings partials). Keep chunks small
+        (~10 days) and add a politeness delay between calls.
+
+        Raises:
+            MlbApiError: on non-2xx response.
+        """
+        params = {
+            "sportId": "1",
+            "startDate": start_date,
+            "endDate": end_date,
+            "hydrate": hydrate,
+        }
+        with httpx.Client(base_url=BASE_URL, timeout=self._timeout) as client:
+            resp = client.get("/api/v1/schedule", params=params)
+            if resp.status_code != 200:
+                raise MlbApiError(f"MLB Stats API returned {resp.status_code}: {resp.text[:500]}")
+            return resp.json()
+
     def get_boxscore(self, game_pk: int) -> dict[str, Any]:
         """Boxscore for a finished (or live) game.
 

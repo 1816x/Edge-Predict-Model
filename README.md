@@ -65,11 +65,12 @@ npm install && npm run dev   # http://localhost:3000 (NEXT_PUBLIC_API_URL apunta
 
 ## Estado
 
-**Fase actual: F0 (fundaciones) en curso.** La propuesta técnica está completa y la capa de
-ingesta ya existe: `python -m app.jobs.sync_schedule` (slate MLB) y
-`python -m app.jobs.snapshot_odds [--closing-window-min N]` (archivo append-only de líneas,
-con closing flag), con tests de integración contra el schema real. Falta: conseguir la API
-key de The Odds API, aplicar el schema a un Postgres gestionado y calendarizar los crons.
+**Fase actual: F0 (fundaciones) en curso.** La propuesta técnica está completa; existen la
+capa de ingesta (`app.jobs.sync_schedule`, `app.jobs.snapshot_odds`), el backfill histórico
+de resultados con scores F5 (`app.jobs.backfill_results`), el arranque del feature builder
+as-of (`app/features/`) y el workflow de crons (`.github/workflows/ingesta.yml`), todo con
+tests de integración contra el schema real. Falta (manual): API key de The Odds API,
+Postgres gestionado con el schema aplicado, y los dos secrets en GitHub Actions.
 Nada de esto ha sido backtesteado ni
 opera con dinero real. El proyecto tiene criterios explícitos para **matarse a sí mismo** si
 no demuestra edge (ver `docs/06-backtesting-y-metricas.md` §go/no-go): si tras ≥300 picks de

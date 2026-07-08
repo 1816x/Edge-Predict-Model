@@ -1,0 +1,60 @@
+{
+  "totalGames": 3,
+  "dates": [
+    {
+      "date": "2024-06-01",
+      "games": [
+        {
+          "gamePk": 800001,
+          "gameDate": "2024-06-01T23:10:00Z",
+          "status": { "abstractGameState": "Final", "detailedState": "Final" },
+          "teams": {
+            "away": { "team": { "id": 147, "name": "New York Yankees" }, "score": 3 },
+            "home": { "team": { "id": 111, "name": "Boston Red Sox" }, "score": 5 }
+          },
+          "linescore": {
+            "currentInning": 9,
+            "innings": [
+              { "num": 1, "away": { "runs": 1 }, "home": { "runs": 0 } },
+              { "num": 2, "away": { "runs": 0 }, "home": { "runs": 3 } },
+              { "num": 3, "away": { "runs": 0 }, "home": { "runs": 0 } },
+              { "num": 4, "away": { "runs": 2 }, "home": { "runs": 0 } },
+              { "num": 5, "away": { "runs": 0 }, "home": { "runs": 1 } },
+              { "num": 6, "away": { "runs": 0 }, "home": { "runs": 0 } },
+              { "num": 7, "away": { "runs": 0 }, "home": { "runs": 1 } },
+              { "num": 8, "away": { "runs": 0 }, "home": { "runs": 0 } },
+              { "num": 9, "away": { "runs": 0 }, "home": {} }
+            ]
+          }
+        },
+        {
+          "gamePk": 800002,
+          "gameDate": "2024-06-01T20:05:00Z",
+          "status": { "abstractGameState": "Final", "detailedState": "Completed Early: Rain" },
+          "teams": {
+            "away": { "team": { "id": 135, "name": "San Diego Padres" }, "score": 1 },
+            "home": { "team": { "id": 119, "name": "Los Angeles Dodgers" }, "score": 2 }
+          },
+          "linescore": {
+            "currentInning": 4,
+            "innings": [
+              { "num": 1, "away": { "runs": 0 }, "home": { "runs": 1 } },
+              { "num": 2, "away": { "runs": 1 }, "home": { "runs": 0 } },
+              { "num": 3, "away": { "runs": 0 }, "home": { "runs": 1 } },
+              { "num": 4, "away": { "runs": 0 }, "home": { "runs": 0 } }
+            ]
+          }
+        },
+        {
+          "gamePk": 800003,
+          "gameDate": "2024-06-01T22:40:00Z",
+          "status": { "abstractGameState": "Preview", "detailedState": "Scheduled" },
+          "teams": {
+            "away": { "team": { "id": 112, "name": "Chicago Cubs" } },
+            "home": { "team": { "id": 138, "name": "St. Louis Cardinals" } }
+          }
+        }
+      ]
+    }
+  ]
+}

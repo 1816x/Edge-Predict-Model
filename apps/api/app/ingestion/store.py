@@ -22,9 +22,16 @@ from sqlalchemy import MetaData, Row, Table, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection, Engine
 
-from app.ingestion.parsers import OddsEvent, OddsOutcome, ScheduledGame
+from app.ingestion.parsers import GameResult, OddsEvent, OddsOutcome, ScheduledGame
 
-INGESTION_TABLES = ("sports", "books", "teams", "events", "odds_snapshots")
+INGESTION_TABLES = (
+    "sports",
+    "books",
+    "teams",
+    "events",
+    "event_results",
+    "odds_snapshots",
+)
 
 EVENT_MATCH_WINDOW = timedelta(hours=3)
 
@@ -204,6 +211,29 @@ def find_or_create_event_for_odds(
         .returning(events.c.id)
     ).scalar_one()
     return new_id, True
+
+
+def upsert_event_result(
+    conn: Connection, t: dict[str, Table], event_id: uuid.UUID, result: GameResult
+) -> None:
+    """Insert or refresh the final score for one event (backfill/settlement)."""
+    event_results = t["event_results"]
+    values = {
+        "event_id": event_id,
+        "home_score": result.home_score,
+        "away_score": result.away_score,
+        "f5_home_score": result.f5_home_score,
+        "f5_away_score": result.f5_away_score,
+        "source": "mlb_stats_api",
+    }
+    conn.execute(
+        pg_insert(event_results)
+        .values(values)
+        .on_conflict_do_update(
+            index_elements=["event_id"],
+            set_={k: v for k, v in values.items() if k != "event_id"},
+        )
+    )
 
 
 def insert_odds_snapshots(

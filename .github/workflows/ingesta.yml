@@ -1,0 +1,90 @@
+# Crons de ingesta F0 (docs/07-roadmap.md).
+#
+# Requisitos (Settings -> Secrets and variables -> Actions -> Secrets):
+#   ODDS_API_KEY   key de The Odds API
+#   DATABASE_URL   postgresql+psycopg://usuario:password@host/dbname
+#
+# Notas operativas:
+# - Los schedules SOLO corren en la rama default (main): hay que mergear
+#   la rama de desarrollo para que arranquen.
+# - GitHub puede retrasar los schedules varios minutos; con cadencia de
+#   horas no importa, y el closing run usa una ventana de 30 min que
+#   absorbe el retraso.
+# - GitHub desactiva los schedules tras ~60 dias sin actividad en el
+#   repo; un commit cualquiera los reactiva.
+# - Todos los jobs son idempotentes: una corrida duplicada no ensucia datos.
+
+name: Ingesta EDGE
+
+on:
+  schedule:
+    # sync_schedule: slate del dia (14:00 UTC ~ manana en America)
+    - cron: '0 14 * * *'
+    # snapshot_odds: archivo de lineas en horario de juegos MLB
+    - cron: '0 15,18,21,0 * * *'
+    # Closing runs cada 30 min en la ventana de inicios (17:00-03:00 UTC
+    # aprox). ALTO consumo de creditos: descomentar al pasar al plan 20K.
+    # - cron: '*/30 16-23,0-3 * * *'
+  workflow_dispatch:
+    inputs:
+      job:
+        description: Job a ejecutar
+        type: choice
+        default: snapshot_odds
+        options:
+          - sync_schedule
+          - snapshot_odds
+          - snapshot_odds_closing
+          - backfill_results
+      args:
+        description: 'Args extra (ej. --start-date 2024-03-20 --end-date 2024-10-01)'
+        type: string
+        default: ''
+
+concurrency:
+  group: ingesta
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ingesta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar edge-api
+        run: pip install --quiet ./apps/api
+
+      - name: Ejecutar job
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          INPUT_JOB: ${{ inputs.job }}
+          INPUT_ARGS: ${{ inputs.args }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            case "$INPUT_JOB" in
+              sync_schedule)         python -m app.jobs.sync_schedule $INPUT_ARGS ;;
+              snapshot_odds)         python -m app.jobs.snapshot_odds $INPUT_ARGS ;;
+              snapshot_odds_closing) python -m app.jobs.snapshot_odds --closing-window-min 30 $INPUT_ARGS ;;
+              backfill_results)      python -m app.jobs.backfill_results $INPUT_ARGS ;;
+              *) echo "job desconocido: $INPUT_JOB" >&2; exit 1 ;;
+            esac
+          elif [ "$SCHEDULE" = "0 14 * * *" ]; then
+            python -m app.jobs.sync_schedule
+          elif [ "$SCHEDULE" = "*/30 16-23,0-3 * * *" ]; then
+            python -m app.jobs.snapshot_odds --closing-window-min 30
+          else
+            python -m app.jobs.snapshot_odds
+          fi
