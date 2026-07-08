@@ -140,6 +140,66 @@ def test_traditional_doubleheader_same_listed_start(db):
 
 
 @pytest.mark.integration
+def test_bulk_chunk_handles_doubleheader_and_adopts_orphan(db):
+    """Bulk path: (a) two same-time games insert as two events; (b) an event
+    created earlier by the odds job (no mlb_game_pk) is adopted, not duped."""
+    from datetime import datetime, timezone
+
+    from app.ingestion import store
+    from app.ingestion.parsers import GameResult, OddsEvent, ScheduledGame
+
+    start = datetime(2018, 6, 18, 21, 5, tzinfo=timezone.utc)
+
+    def game(pk, home="Chicago Cubs", away="St. Louis Cardinals", when=start):
+        return ScheduledGame(
+            game_pk=pk, start_time=when, status="final",
+            home_name=home, away_name=away, home_mlb_id=None, away_mlb_id=None,
+            home_probable=None, away_probable=None,
+        )
+
+    tables = store.reflect_tables(db)
+    with db.begin() as conn:
+        sport_id = store.get_sport_id(conn, tables)
+        # Orphan from the odds job: same matchup as pk 530771, 5 min drift.
+        store.find_or_create_event_for_odds(
+            conn, tables, sport_id,
+            OddsEvent(
+                source_id="abc123", home_team="Boston Red Sox",
+                away_team="New York Yankees",
+                commence_time=datetime(2018, 6, 18, 23, 5, tzinfo=timezone.utc),
+                outcomes=(), skipped=(),
+            ),
+        )
+        cache = store.load_team_cache(conn, tables, sport_id)
+        games = [
+            game(530769), game(530770),  # traditional doubleheader, same time
+            game(530771, "Boston Red Sox", "New York Yankees",
+                 datetime(2018, 6, 18, 23, 10, tzinfo=timezone.utc)),
+        ]
+        results = {530769: GameResult(530769, 3, 1, 2, 0)}
+        counts = store.bulk_upsert_schedule_chunk(
+            conn, tables, sport_id, games, results, cache
+        )
+
+    assert counts["events_created"] == 2  # the two doubleheader games
+    assert counts["events_refreshed"] == 1  # the adopted orphan
+    assert counts["results_upserted"] == 1
+    with db.connect() as conn:
+        total = conn.execute(text("SELECT count(*) FROM events")).scalar()
+        adopted = conn.execute(
+            text(
+                """
+                SELECT count(*) FROM events
+                WHERE external_ids ->> 'the_odds_api_id' = 'abc123'
+                  AND external_ids ->> 'mlb_game_pk' = '530771'
+                """
+            )
+        ).scalar()
+    assert total == 3
+    assert adopted == 1
+
+
+@pytest.mark.integration
 def test_migration_001_is_idempotent(db):
     """The deployed-DB migration must run cleanly even on a fresh schema
     that already ships the final shape."""
