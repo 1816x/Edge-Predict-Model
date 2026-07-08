@@ -1,8 +1,5 @@
 # EDGE — Plataforma cuantitativa de decisión para apuestas deportivas
 
-> Codename provisional. El repo se reutilizó de un proyecto anterior (estaba vacío); renombrar
-> repo y producto cuando el owner elija marca.
-
 Sistema SaaS que estima **probabilidades calibradas** para mercados deportivos, las compara
 contra la **probabilidad implícita sin vig** del mercado y detecta apuestas con **expected
 value positivo**, con gestión de riesgo (Kelly fraccional) y trazabilidad completa de cada pick.
