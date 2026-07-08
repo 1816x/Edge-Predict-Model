@@ -249,6 +249,160 @@ def upsert_event_result(
     )
 
 
+def load_team_cache(conn: Connection, t: dict[str, Table], sport_id: uuid.UUID) -> dict[str, uuid.UUID]:
+    """All known teams for a sport, keyed by name (backfill hot path)."""
+    teams = t["teams"]
+    rows = conn.execute(
+        select(teams.c.name, teams.c.id).where(teams.c.sport_id == sport_id)
+    ).all()
+    return {row.name: row.id for row in rows}
+
+
+def bulk_upsert_schedule_chunk(
+    conn: Connection,
+    t: dict[str, Table],
+    sport_id: uuid.UUID,
+    games: list[ScheduledGame],
+    results: dict[int, "GameResult"],
+    team_cache: dict[str, uuid.UUID],
+) -> dict[str, int]:
+    """Chunk-sized bulk version of the schedule/results upsert.
+
+    The per-game path costs ~6 round trips per game — fatal against a remote
+    Postgres (the first production backfill timed out). This path does a
+    handful of statements per chunk with identical semantics:
+    pk-first identity, merge-only-into-events-without-pk fallback, results
+    upserted with ON CONFLICT.
+    """
+    events = t["events"]
+    counts = {"events_created": 0, "events_refreshed": 0, "results_upserted": 0}
+    if not games:
+        return counts
+
+    all_teams = {g.home_name: g.home_mlb_id for g in games}
+    all_teams.update({g.away_name: g.away_mlb_id for g in games})
+    for name, mlb_id in all_teams.items():
+        if name not in team_cache:
+            team_cache[name] = get_or_create_team(conn, t, sport_id, name, mlb_id)
+
+    pk_texts = [str(g.game_pk) for g in games]
+    existing = {
+        row.pk: row
+        for row in conn.execute(
+            select(
+                events.c.id,
+                events.c.external_ids["mlb_game_pk"].astext.label("pk"),
+                events.c.start_time_utc,
+                events.c.status,
+            ).where(events.c.external_ids["mlb_game_pk"].astext.in_(pk_texts))
+        )
+    }
+
+    # Candidate merge targets: events in the chunk's window WITHOUT an MLB
+    # identity (created by the odds job). Rare — only current-season overlap.
+    starts = [g.start_time for g in games]
+    orphan_rows = conn.execute(
+        select(
+            events.c.id, events.c.external_ids, events.c.home_team_id,
+            events.c.away_team_id, events.c.start_time_utc,
+        ).where(
+            events.c.sport_id == sport_id,
+            ~events.c.external_ids.has_key("mlb_game_pk"),
+            events.c.start_time_utc >= min(starts) - EVENT_MATCH_WINDOW,
+            events.c.start_time_utc <= max(starts) + EVENT_MATCH_WINDOW,
+        )
+    ).all()
+    orphans = list(orphan_rows)
+
+    event_ids: dict[int, uuid.UUID] = {}
+    to_insert: list[dict] = []
+    for game in games:
+        pk = str(game.game_pk)
+        home_id = team_cache[game.home_name]
+        away_id = team_cache[game.away_name]
+        row = existing.get(pk)
+        if row is not None:
+            event_ids[game.game_pk] = row.id
+            if row.start_time_utc != game.start_time or row.status != game.status:
+                conn.execute(
+                    update(events)
+                    .where(events.c.id == row.id)
+                    .values(start_time_utc=game.start_time, status=game.status)
+                )
+                counts["events_refreshed"] += 1
+            continue
+        merge = min(
+            (
+                o for o in orphans
+                if o.home_team_id == home_id and o.away_team_id == away_id
+                and abs((o.start_time_utc - game.start_time).total_seconds())
+                <= EVENT_MATCH_WINDOW.total_seconds()
+            ),
+            key=lambda o: abs((o.start_time_utc - game.start_time).total_seconds()),
+            default=None,
+        )
+        if merge is not None:
+            orphans.remove(merge)
+            conn.execute(
+                update(events)
+                .where(events.c.id == merge.id)
+                .values(
+                    external_ids={**(merge.external_ids or {}), "mlb_game_pk": pk},
+                    start_time_utc=game.start_time,
+                    status=game.status,
+                )
+            )
+            event_ids[game.game_pk] = merge.id
+            counts["events_refreshed"] += 1
+            continue
+        to_insert.append(
+            {
+                "sport_id": sport_id,
+                "home_team_id": home_id,
+                "away_team_id": away_id,
+                "start_time_utc": game.start_time,
+                "status": game.status,
+                "external_ids": {"mlb_game_pk": pk},
+            }
+        )
+
+    if to_insert:
+        inserted = conn.execute(
+            pg_insert(events)
+            .values(to_insert)
+            .returning(events.c.id, events.c.external_ids["mlb_game_pk"].astext)
+        ).all()
+        for event_id, pk in inserted:
+            event_ids[int(pk)] = event_id
+        counts["events_created"] = len(inserted)
+
+    result_rows = [
+        {
+            "event_id": event_ids[pk],
+            "home_score": r.home_score,
+            "away_score": r.away_score,
+            "f5_home_score": r.f5_home_score,
+            "f5_away_score": r.f5_away_score,
+            "source": "mlb_stats_api",
+        }
+        for pk, r in results.items()
+        if pk in event_ids
+    ]
+    if result_rows:
+        stmt = pg_insert(t["event_results"]).values(result_rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["event_id"],
+            set_={
+                col: getattr(stmt.excluded, col)
+                for col in ("home_score", "away_score", "f5_home_score", "f5_away_score", "source")
+            },
+        )
+        conn.execute(stmt)
+        counts["results_upserted"] = len(result_rows)
+
+    return counts
+
+
 def insert_odds_snapshots(
     conn: Connection,
     t: dict[str, Table],

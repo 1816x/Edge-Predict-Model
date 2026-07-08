@@ -56,9 +56,17 @@ def run(
         "chunks": 0,
         "games_in_feed": 0,
         "finals_with_score": 0,
+        "events_created": 0,
+        "events_refreshed": 0,
         "results_upserted": 0,
         "f5_missing": 0,
     }
+
+    # Team cache shared across chunks: after the first chunk every MLB team
+    # is known and team resolution costs zero round trips.
+    with engine.connect() as conn:
+        sport_id = store.get_sport_id(conn, tables)
+        team_cache = store.load_team_cache(conn, tables, sport_id)
 
     chunk_start = start
     while chunk_start <= end:
@@ -68,18 +76,19 @@ def run(
         results = {r.game_pk: r for r in parse_schedule_results(payload)}
 
         with engine.begin() as conn:
-            sport_id = store.get_sport_id(conn, tables)
-            for game in games:
-                event_id, _ = store.upsert_event_from_schedule(conn, tables, sport_id, game)
-                result = results.get(game.game_pk)
-                if result is not None:
-                    store.upsert_event_result(conn, tables, event_id, result)
-                    summary["results_upserted"] += 1
-                    summary["f5_missing"] += int(result.f5_home_score is None)
+            counts = store.bulk_upsert_schedule_chunk(
+                conn, tables, sport_id, games, results, team_cache
+            )
 
         summary["chunks"] += 1
         summary["games_in_feed"] += len(games)
         summary["finals_with_score"] += len(results)
+        summary["events_created"] += counts["events_created"]
+        summary["events_refreshed"] += counts["events_refreshed"]
+        summary["results_upserted"] += counts["results_upserted"]
+        summary["f5_missing"] += sum(
+            1 for r in results.values() if r.f5_home_score is None
+        )
         chunk_start = chunk_end + timedelta(days=1)
         if chunk_start <= end and sleep_seconds > 0:
             time.sleep(sleep_seconds)
