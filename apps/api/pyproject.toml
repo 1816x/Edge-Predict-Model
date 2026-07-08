@@ -15,6 +15,7 @@ dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.1",
 ]
 
 [project.optional-dependencies]
@@ -29,3 +30,6 @@ include = ["app*"]
 testpaths = ["tests"]
 # Make the local `app` package importable without installing it.
 pythonpath = ["."]
+markers = [
+    "integration: needs Postgres with infra/schema.sql applied (EDGE_TEST_DATABASE_URL)",
+]

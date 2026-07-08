@@ -1,0 +1,69 @@
+{
+  "totalGames": 3,
+  "dates": [
+    {
+      "date": "2026-07-08",
+      "games": [
+        {
+          "gamePk": 745001,
+          "gameDate": "2026-07-08T23:10:00Z",
+          "status": {
+            "abstractGameState": "Preview",
+            "detailedState": "Scheduled"
+          },
+          "teams": {
+            "away": {
+              "team": { "id": 147, "name": "New York Yankees" },
+              "probablePitcher": { "id": 543037, "fullName": "Gerrit Cole" }
+            },
+            "home": {
+              "team": { "id": 111, "name": "Boston Red Sox" },
+              "probablePitcher": { "id": 601713, "fullName": "Nick Pivetta" }
+            }
+          },
+          "venue": { "id": 3, "name": "Fenway Park" },
+          "doubleHeader": "N",
+          "gameNumber": 1
+        },
+        {
+          "gamePk": 745002,
+          "gameDate": "2026-07-08T20:10:00Z",
+          "status": {
+            "abstractGameState": "Preview",
+            "detailedState": "Scheduled"
+          },
+          "teams": {
+            "away": {
+              "team": { "id": 135, "name": "San Diego Padres" }
+            },
+            "home": {
+              "team": { "id": 119, "name": "Los Angeles Dodgers" }
+            }
+          },
+          "venue": { "id": 22, "name": "Dodger Stadium" },
+          "doubleHeader": "S",
+          "gameNumber": 1
+        },
+        {
+          "gamePk": 745003,
+          "gameDate": "2026-07-09T02:10:00Z",
+          "status": {
+            "abstractGameState": "Preview",
+            "detailedState": "Scheduled"
+          },
+          "teams": {
+            "away": {
+              "team": { "id": 135, "name": "San Diego Padres" }
+            },
+            "home": {
+              "team": { "id": 119, "name": "Los Angeles Dodgers" }
+            }
+          },
+          "venue": { "id": 22, "name": "Dodger Stadium" },
+          "doubleHeader": "S",
+          "gameNumber": 2
+        }
+      ]
+    }
+  ]
+}

@@ -65,7 +65,12 @@ npm install && npm run dev   # http://localhost:3000 (NEXT_PUBLIC_API_URL apunta
 
 ## Estado
 
-**Fase actual: propuesta técnica + scaffold (pre-F0).** Nada de esto ha sido backtesteado ni
+**Fase actual: F0 (fundaciones) en curso.** La propuesta técnica está completa y la capa de
+ingesta ya existe: `python -m app.jobs.sync_schedule` (slate MLB) y
+`python -m app.jobs.snapshot_odds [--closing-window-min N]` (archivo append-only de líneas,
+con closing flag), con tests de integración contra el schema real. Falta: conseguir la API
+key de The Odds API, aplicar el schema a un Postgres gestionado y calendarizar los crons.
+Nada de esto ha sido backtesteado ni
 opera con dinero real. El proyecto tiene criterios explícitos para **matarse a sí mismo** si
 no demuestra edge (ver `docs/06-backtesting-y-metricas.md` §go/no-go): si tras ≥300 picks de
 paper trading no bate el CLV ni el log loss del market prior, se descarta con costo hundido

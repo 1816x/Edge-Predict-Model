@@ -44,6 +44,30 @@ Endpoints del MVP:
 | `GET`  | `/api/v1/picks/{pick_id}` | Stub tipado (404 hasta que exista persistencia) |
 | `GET`  | `/api/v1/performance` | Stub tipado (métricas en cero/null con TODO) |
 
+## Base de datos y jobs de ingesta (F0)
+
+La fuente de verdad del schema es `infra/schema.sql` (raíz del repo); el código Python
+refleja las tablas de la BD viva en vez de duplicarlas como modelos ORM.
+
+```bash
+# aplicar el schema
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f ../../infra/schema.sql
+
+# sync del slate del día (MLB Stats API, gratis) — idempotente
+python -m app.jobs.sync_schedule --date 2026-07-08
+
+# snapshot de odds actuales (The Odds API, requiere ODDS_API_KEY)
+python -m app.jobs.snapshot_odds
+
+# cerca del primer pitch: flaggear la closing line
+python -m app.jobs.snapshot_odds --closing-window-min 20
+```
+
+Cadencia recomendada (plan de créditos en `docs/02-fuentes-de-datos.md`): schedule una
+vez por la mañana; odds cada 2-4 h + una corrida cercana al inicio de cada juego con
+`--closing-window-min`. Acumular snapshots propios desde el día 1 es el criterio de
+salida de F0 (`docs/07-roadmap.md`).
+
 ## Correr los tests
 
 Desde `apps/api/` con el venv activado:
@@ -52,9 +76,15 @@ Desde `apps/api/` con el venv activado:
 pytest
 ```
 
-Los tests cubren el core cuantitativo (`app/core/`): conversión de odds, no-vig
-multiplicativo, edge/EV, Kelly fraccional con cap y CLV, con casos calculados a mano.
-Los tests **no** llaman APIs externas.
+Los tests cubren el core cuantitativo (`app/core/`) con casos calculados a mano, los
+parsers de ingesta con fixtures grabados, y — si `EDGE_TEST_DATABASE_URL` apunta a un
+Postgres con `infra/schema.sql` aplicado — la integración completa de los jobs
+(idempotencia, matching de doubleheaders, dedupe append-only, closing flag). Sin esa
+variable, los tests de integración se saltan. Los tests **no** llaman APIs externas.
+
+```bash
+EDGE_TEST_DATABASE_URL="postgresql+psycopg://user@host/dbname" pytest
+```
 
 ## Estructura
 
@@ -64,7 +94,9 @@ app/
   config.py          # Settings (pydantic-settings, lee .env)
   core/              # matemáticas del motor: devig, ev, kelly, clv (implementación real)
   api/               # routers: analyze, picks, performance
-  ingestion/         # clientes The Odds API v4 y MLB Stats API (no se llaman en tests)
+  db/                # engine + reflection (infra/schema.sql es la fuente de verdad)
+  ingestion/         # clientes (The Odds API v4, MLB Stats API) + parsers puros + store
+  jobs/              # crons F0: sync_schedule, snapshot_odds (python -m app.jobs.*)
   picks/             # PickRecord (auditoría) + PickRepository (in-memory para tests)
-tests/               # pytest del core cuantitativo
+tests/               # pytest: core + parsers (fixtures) + integración de jobs (Postgres)
 ```
