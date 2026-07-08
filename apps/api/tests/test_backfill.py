@@ -14,7 +14,9 @@ from conftest import load_fixture
 class TestParseScheduleResults:
     def test_final_games_with_f5_sums(self):
         results = {r.game_pk: r for r in parse_schedule_results(load_fixture("mlb_schedule_results.json"))}
-        assert set(results) == {800001, 800002}  # the Preview game is skipped
+        # The Preview game is skipped; the spring-training final (800004)
+        # parses fine — the regular-season filter lives in the JOB, not here.
+        assert set(results) == {800001, 800002, 800004}
 
         full_game = results[800001]
         assert (full_game.home_score, full_game.away_score) == (5, 3)
@@ -33,7 +35,7 @@ class TestParseScheduleResults:
         payload = load_fixture("mlb_schedule_results.json")
         del payload["dates"][0]["games"][0]["teams"]["home"]["score"]
         results = parse_schedule_results(payload)
-        assert [r.game_pk for r in results] == [800002]
+        assert [r.game_pk for r in results] == [800002, 800004]
 
     def test_incomplete_fifth_inning_yields_null_f5(self):
         payload = load_fixture("mlb_schedule_results.json")
@@ -60,7 +62,9 @@ def test_backfill_upserts_events_and_results(db):
         "2024-06-01", "2024-06-01", client=client, engine=db, sleep_seconds=0
     )
     assert summary["chunks"] == 1
-    assert summary["games_in_feed"] == 3
+    assert summary["games_in_feed"] == 4
+    # The spring-training final (gamePk 800004) never reaches the corpus.
+    assert summary["games_non_regular_skipped"] == 1
     assert summary["results_upserted"] == 2
     assert summary["f5_missing"] == 1
 

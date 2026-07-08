@@ -55,6 +55,7 @@ def run(
         "end_date": end_date,
         "chunks": 0,
         "games_in_feed": 0,
+        "games_non_regular_skipped": 0,
         "finals_with_score": 0,
         "events_created": 0,
         "events_refreshed": 0,
@@ -72,8 +73,18 @@ def run(
     while chunk_start <= end:
         chunk_end = min(chunk_start + timedelta(days=chunk_days - 1), end)
         payload = client.get_schedule_range(chunk_start.isoformat(), chunk_end.isoformat())
-        games = parse_schedule(payload)
-        results = {r.game_pk: r for r in parse_schedule_results(payload)}
+        all_games = parse_schedule(payload)
+        # Training corpus = REGULAR SEASON ONLY. Spring training (split
+        # squads, resting starters) and postseason (different usage
+        # patterns) would poison the team-form features (docs/04 §5).
+        games = [g for g in all_games if g.game_type == "R"]
+        summary["games_non_regular_skipped"] += len(all_games) - len(games)
+        kept_pks = {g.game_pk for g in games}
+        results = {
+            r.game_pk: r
+            for r in parse_schedule_results(payload)
+            if r.game_pk in kept_pks
+        }
 
         with engine.begin() as conn:
             counts = store.bulk_upsert_schedule_chunk(
@@ -81,7 +92,7 @@ def run(
             )
 
         summary["chunks"] += 1
-        summary["games_in_feed"] += len(games)
+        summary["games_in_feed"] += len(all_games)
         summary["finals_with_score"] += len(results)
         summary["events_created"] += counts["events_created"]
         summary["events_refreshed"] += counts["events_refreshed"]
