@@ -25,6 +25,7 @@ Usuario ingresa partido -> resolver evento -> obtener odds -> obtener stats
 ## Estructura del repo
 
 ```
+PLAN.md                       Estado operativo vivo: fase actual, reparto, siguiente jugada
 docs/
   00-decisiones.md            Registro de decisiones de alcance + addenda
   01-propuesta-tecnica.md     Visión, arquitectura, papel del LLM, SaaS, dashboard, flujo e2e
