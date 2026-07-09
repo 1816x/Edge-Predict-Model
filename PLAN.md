@@ -5,7 +5,7 @@
 > `docs/07-roadmap.md`; los umbrales go/no-go en `docs/06-backtesting-y-metricas.md`.
 > Actualizar este archivo en cada hito.
 
-**Última actualización**: 2026-07-09 · **Fase actual: F0 (día 2/14) + F1 en construcción**
+**Última actualización**: 2026-07-09 (noche) · **Fase actual: F0 (reloj reiniciado 2026-07-10) + F1 con bloque de abridor en producción**
 
 ---
 
@@ -18,9 +18,10 @@
 - [x] Crons en GitHub Actions (`.github/workflows/ingesta.yml`) con secrets configurados
 - [x] **Decisión de créditos tomada**: variable `ODDS_INCLUDE_F5=false` en Actions (free tier; el plan 20K queda para cuando el modelo lo justifique)
 - [x] **Backfill histórico 2018–2026 completo**: 19,277 juegos de temporada regular con resultado y parciales F5 (corridas #7–#16, con dos bugs de producción diagnosticados y corregidos en el camino: PRs #5 y #6)
-- [x] **Pipeline F1 v1 corrido** (run #18): walk-forward 2022–2026, logística + HistGB + calibración Platt. Con solo forma de equipo (18 features) la logística calibrada mejora ~0.005 de log loss al baseline home_rate en 2022–2025 y NO lo bate en 2026 parcial. ECE 0.01–0.03. **Conclusión: faltan features de abridor** (el bloque más importante según docs/04 §1.3) — es la tanda en curso.
-- [ ] **Reloj de F0 corriendo**: 14 días de snapshots sin huecos (inicio 2026-07-08 → meta ≈ 2026-07-22). Riesgo detectado: GitHub retrasa los crons del minuto :00 hasta 4 h; mitigado moviéndolos a minutos raros (14:17, XX:23) y con el job `audit_snapshots` como detector de huecos.
-- [ ] **Gate real de F1 pendiente de datos**: batir el log loss del market prior (docs/04 §2.4) exige odds pre-juego archivadas; nuestro archivo empezó 2026-07-08. La tubería de evaluación ya queda lista y el gate se evalúa solo cuando el subconjunto con odds alcance n≥200 (~2 meses de F0/F2).
+- [x] **Tanda F1 en producción** (PR #9, 2026-07-09): migración 003 aplicada, backfill de pitcheo 2018–2026 completo (9 corridas verdes, ~124K líneas, 0 anomalías de parseo, 0 eventos faltantes), features de abridor en builder y dataset (paridad testeada), crons robustos, `audit_snapshots`, tubería del market prior. 160 tests.
+- [x] **Pipeline F1 v2 corrido** (run #34, con bloque de abridor, sp_coverage 0.928 — el ~7% restante son arranques fríos legítimos: abril 2018 sin liga previa, debuts): mejora el log loss en las 10 celdas del walk-forward vs v1. Moneyline logística calibrada: 0.6814/0.6836/0.6840/0.6859/0.6910 (2022–2026) — ahora SÍ bate al home_rate también en 2026. F5 mejora el doble que ML (0.6739/0.6818/0.6795/0.6843/0.6947), como predecía docs/04 §1.3; en F5-2026 parcial el mejor es hist_gb (0.6916 ≈ home_rate 0.6916). ECE ≤ 0.031 en todo.
+- [ ] **Reloj de F0 REINICIADO 2026-07-10 → meta ≈ 2026-07-24**: el primer `audit_snapshots` (run #36) confirmó huecos reales los días 1–2 causados por los retrasos de los crons `:00` viejos (el snapshot de las 15:00 del 07-09 disparó a las 17:24, después de los juegos tempranos). La cadencia nueva (sync+snapshot a las XX:23, audit diario `--fail-on-gaps` en el cron de 14:17) corre desde el merge — el reloj limpio empieza el 07-10.
+- [ ] **Gate real de F1 pendiente de datos**: batir el log loss del market prior (docs/04 §2.4) exige odds pre-juego archivadas. Con ~14 juegos/día con snapshot sharp, el subconjunto 2026 alcanza n≥200 hacia ~2026-07-24 (coincide con el cierre de F0) — la primera evaluación real del gate saldrá sola en el train_f1 de esa fecha.
 
 ## 2. Cómo trabajamos (ramas y reparto)
 
@@ -45,24 +46,20 @@ Ciclo: Claude push a su rama → PR a `main` → merge → los crons toman el c�
 
 ## 3. Siguiente jugada (esta semana)
 
-1. **(Claude — en curso, esta tanda)** Bloque de abridor end-to-end:
-   - Migración 003: tablas `players`, `pitching_game_logs`, `event_probables`.
-   - Job `backfill_pitching` (boxscores de MLB Stats API; también corre a diario tras el sync).
-   - Features `sp_kbb_pct_*`, `sp_xfip_*`, `sp_days_rest`, `sp_pitch_count_l2_starts`, `sp_is_lhp` as-of estrictas, en el builder online y en el dataset bulk con paridad testeada.
-   - `audit_snapshots` (detector de huecos F0) y tubería del market prior en `train_f1`.
-2. **(Tú — al mergear el PR de esta tanda)** En Actions, en este orden:
-   1. `apply_migration` con args `--file infra/migrations/003-pitching-and-probables.sql` (puede correrse desde la rama del PR incluso antes del merge: es aditiva e idempotente).
-   2. `backfill_pitching`, una temporada por corrida (mismos rangos que los backfills de resultados: 2018-03-29→2018-10-01, 2019-03-20→2019-09-29, 2020-07-23→2020-09-27, 2021-04-01→2021-10-03, 2022-04-07→2022-10-05, 2023-03-30→2023-10-01, 2024-03-20→2024-09-30, 2025-03-18→2025-09-28, 2026-03-25→ayer). Si una corrida muere por timeout, relanzar con los mismos args: retoma donde quedó.
-   3. `train_f1` — verificar en el summary que `sp_coverage` >95% y comparar el log loss contra la corrida #18.
-   4. `audit_snapshots` — primer reporte de huecos del archivo F0.
-3. **(Ambos)** Vigilar 1–2 días que el cron diario de 14:17 UTC corra sus tres pasos (sync + resultados + pitcheo) y que los snapshots salgan a XX:23.
+1. **(Ambos)** Vigilar 1–2 días la cadencia nueva: cron diario de 14:17 UTC con sus 4 pasos (sync + resultados 3d + pitcheo 3d + audit de ayer con `--fail-on-gaps`) y snapshots a las XX:23 precedidos de sync. Si el audit pinta rojo, diagnóstico antes que nada.
+2. **(Automático)** El train_f1 de ~2026-07-24 trae la primera evaluación real del gate (market prior n≥200 en 2026) y coincide con el cierre del reloj F0. No hay nada que hacer más que dejar que el archivo crezca.
+3. **(Claude — siguiente tanda, cuando digas)** Con el bloque de abridor rindiendo, las opciones en orden de valor esperado:
+   - **Bloque de bullpen** (docs/04 §1.4, solo ML): `pitching_game_logs` ya guarda TODAS las líneas (relevistas incluidos) — es feature engineering puro, sin ingesta nueva.
+   - **Ofensiva real de equipo** (docs/04 §1.2): wOBA/ISO/K%/BB% exigen ingerir líneas de bateo (extensión natural de `backfill_pitching` a boxscore completo).
+   - Interacción mano del abridor × splits (necesita lo anterior).
+4. **(Tú — opcional)** Si el gate de ~07-24 se ve prometedor, considerar el plan 20K de The Odds API para activar los closing runs (CLV real, hoy comentados en el workflow).
 
 ## 4. Fases y gates (resumen — detalle en `docs/07-roadmap.md`)
 
 | Fase | Qué es | Criterio de salida (gate) | Estado |
 |---|---|---|---|
-| **F0 Fundaciones** | Ingesta + archivo de líneas propio | 14 días de snapshots sin huecos | 🟢 **en curso** (día 2/14) |
-| **F1 Modelo** | Features as-of, entrenamiento, calibración, backtest | log loss < market prior en walk-forward **y** ECE ≤ 0.03 | 🟡 en construcción (bloque abridor); gate esperando archivo de odds (n≥200) |
+| **F0 Fundaciones** | Ingesta + archivo de líneas propio | 14 días de snapshots sin huecos | 🟢 **en curso** (reloj reiniciado 07-10 → meta 07-24; cadencia nueva + audit diario) |
+| **F1 Modelo** | Features as-of, entrenamiento, calibración, backtest | log loss < market prior en walk-forward **y** ECE ≤ 0.03 | 🟡 features de abridor en producción y rindiendo; gate esperando archivo de odds (n≥200 ≈ 07-24) |
 | **F2 Paper trading** | Picks registrados sin dinero, dashboard interno | ≥300 picks y evaluación go/no-go de `docs/06` | — |
 | **F3 SaaS beta** | Auth, suscripciones, disclaimers | **Solo si F2 pasa.** Revisión legal ANTES de cobrar | — |
 | **F4 Más mercados MLB** | NRFI/YRFI, K's de pitchers | Cada mercado repite gates F1/F2 | — |
@@ -89,4 +86,7 @@ Ciclo: Claude push a su rama → PR a `main` → merge → los crons toman el c�
 | 2026-07-08 | **F0 en producción**: run #6 verde — 15 eventos, 1,168 snapshots, F5 completo, 0 errores |
 | 2026-07-08 | Pipeline F1 walk-forward (PR #3) + hardening de backfill en producción: concurrencia (PR #4), bulk 5 stmts/chunk (PR #5), dedupe suspendidos (PR #6), solo temporada regular (PR #7), fix json int32 (PR #8) |
 | 2026-07-08 | **Backfill 2018–2026 completo** (19,277 juegos) y **primer train_f1 verde** (run #18): señal marginal con solo forma de equipo; gate vs market prior no evaluable aún |
-| 2026-07-09 | Tanda F1 en curso: ingesta de pitcheo + features de abridor + crons robustos + audit de huecos + tubería market prior |
+| 2026-07-09 | **Tanda F1 mergeada** (PR #9): ingesta de pitcheo + features de abridor + crons robustos + audit de huecos + tubería market prior. 160 tests; revisión adversarial con 10 fixes |
+| 2026-07-09 | Migración 003 aplicada y **backfill de pitcheo 2018–2026 completo** en Actions (9 corridas verdes, ~124K líneas, 0 anomalías) |
+| 2026-07-09 | **train_f1 v2 (run #34)**: el bloque de abridor mejora el log loss en las 10 celdas del walk-forward; F5 mejora el doble que ML; en 2026 la logística ya bate al baseline. sp_coverage 0.928 |
+| 2026-07-09 | Primer `audit_snapshots` (run #36): huecos reales días 1–2 por los crons `:00` viejos → **reloj F0 reiniciado: 2026-07-10 → meta 2026-07-24** |
