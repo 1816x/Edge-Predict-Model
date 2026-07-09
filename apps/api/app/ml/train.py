@@ -9,10 +9,14 @@ Baselines:
 - ``constant``: p = 0.5 for every game.
 - ``home_rate``: expanding home-win rate using only games strictly before
   each test game (leak-free running mean).
-- ``market_prior`` (the REAL gate of docs/04 §2.4) is NOT computable yet:
-  it needs historical odds, which the free tier does not provide. Until the
-  own-snapshot archive matures (or a paid historical backfill), model-vs-
-  market claims are out of reach and this report says so explicitly.
+- ``market_prior`` (the REAL gate of docs/04 §2.4): computable only for
+  games with a pregame sharp-book snapshot in the own archive, which
+  started 2026-07-08 — so only on a growing SUBSET of recent games. When
+  the frame carries ``market_prior_p_home``, each test season reports the
+  prior's metrics AND every model's metrics over that same subset (never
+  compare metrics across different rows). Below MIN_GATE_N evaluable games
+  the gate is explicitly NOT evaluated: a conclusion from 30 games would
+  be noise wearing a suit.
 """
 
 from __future__ import annotations
@@ -28,6 +32,9 @@ from sklearn.linear_model import LogisticRegression
 from app.ml.dataset import FEATURE_COLUMNS
 
 MIN_TRAIN_SEASONS = 4
+# Minimum games with an archived pregame prior before the docs/04 §2.4 gate
+# (model log loss < market prior log loss) is worth evaluating at all.
+MIN_GATE_N = 200
 _EPS = 1e-6
 
 
@@ -151,15 +158,63 @@ def walk_forward_report(
                 l2_regularization=1.0, random_state=7,
             ),
         }
+        p_calibrated: dict[str, np.ndarray] = {}
         for name, model in models.items():
             model.fit(x_fit, y_fit)
             calibrator = PlattCalibrator.fit(model.predict_proba(x_calib)[:, 1], y_calib)
             p_test_raw = model.predict_proba(x_test)[:, 1]
+            p_calibrated[name] = calibrator.apply(p_test_raw)
             season_report[name] = {
                 "raw": _metrics(y_test, p_test_raw),
-                "calibrated": _metrics(y_test, calibrator.apply(p_test_raw)),
+                "calibrated": _metrics(y_test, p_calibrated[name]),
             }
+
+        if "market_prior_p_home" in frame.columns:
+            season_report["market_prior_subset"] = _market_prior_subset(
+                frame.loc[test_mask, "market_prior_p_home"].to_numpy(dtype=float),
+                y_test,
+                p_calibrated,
+            )
 
         report["seasons"][int(test_season)] = season_report
 
     return report
+
+
+def _market_prior_subset(
+    prior: np.ndarray, y_test: np.ndarray, p_calibrated: dict[str, np.ndarray]
+) -> dict[str, Any]:
+    """docs/04 §2.4 gate material: prior AND models scored on the SAME rows.
+
+    Comparing a model's full-season log loss against the prior's subset log
+    loss would be apples to oranges; every number here uses only the games
+    that actually have an archived pregame prior.
+    """
+    mask = ~np.isnan(prior)
+    n = int(mask.sum())
+    out: dict[str, Any] = {"n": n, "min_gate_n": MIN_GATE_N}
+    if n == 0:
+        out["note"] = "no games with archived pregame sharp odds in this season"
+        return out
+    y_sub = y_test[mask]
+    out["market_prior"] = _metrics(y_sub, prior[mask])
+    for name, p in p_calibrated.items():
+        out[f"{name}_calibrated"] = _metrics(y_sub, p[mask])
+    if n < MIN_GATE_N:
+        out["gate"] = {
+            "evaluated": False,
+            "note": (
+                f"insufficient sample (n={n} < {MIN_GATE_N}); gate NOT "
+                "evaluated — publishing stays blocked"
+            ),
+        }
+    else:
+        out["gate"] = {
+            "evaluated": True,
+            "beaten_by": {
+                name: out[f"{name}_calibrated"]["log_loss"]
+                < out["market_prior"]["log_loss"]
+                for name in p_calibrated
+            },
+        }
+    return out

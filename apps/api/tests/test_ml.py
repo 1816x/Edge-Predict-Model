@@ -194,6 +194,97 @@ class TestStarterFeatures:
         assert self._by_event()["g0"]["sp_is_lhp"] == 1.0
 
 
+class TestMarketPriorSubset:
+    def _frame(self):
+        return ds.build_training_frame(_synthetic_games(), "moneyline")
+
+    def test_no_prior_column_no_subset(self):
+        report = tr.walk_forward_report(self._frame(), min_train_seasons=4)
+        assert all(
+            "market_prior_subset" not in rep for rep in report["seasons"].values()
+        )
+
+    def test_gate_not_evaluated_below_min_n(self):
+        frame = self._frame()
+        frame["market_prior_p_home"] = np.nan
+        rows_2022 = frame.index[frame["season"] == 2022][:50]
+        frame.loc[rows_2022, "market_prior_p_home"] = 0.5
+        report = tr.walk_forward_report(frame, min_train_seasons=4)
+
+        sub = report["seasons"][2022]["market_prior_subset"]
+        assert sub["n"] == 50
+        assert sub["gate"]["evaluated"] is False
+        assert "publishing stays blocked" in sub["gate"]["note"]
+        # A constant-0.5 prior scores ln(2) on any outcome mix.
+        assert sub["market_prior"]["log_loss"] == pytest.approx(0.69315, abs=1e-4)
+        # Models are ALSO scored on those same 50 rows, never the full season.
+        assert sub["logistic_calibrated"]["n"] == 50
+
+        empty = report["seasons"][2023]["market_prior_subset"]
+        assert empty["n"] == 0
+        assert "gate" not in empty
+
+    def test_gate_evaluated_with_enough_sample(self):
+        frame = self._frame()
+        frame["market_prior_p_home"] = np.nan
+        frame.loc[frame["season"] == 2023, "market_prior_p_home"] = 0.5
+        report = tr.walk_forward_report(frame, min_train_seasons=4)
+
+        sub = report["seasons"][2023]["market_prior_subset"]
+        assert sub["n"] >= tr.MIN_GATE_N
+        assert sub["gate"]["evaluated"] is True
+        # Against a coin-flip prior the learned models must win (same claim
+        # the baseline_constant assertion makes on the full season).
+        assert sub["gate"]["beaten_by"] == {"logistic": True, "hist_gb": True}
+
+        import json
+
+        json.dumps(report)
+
+
+@pytest.mark.integration
+def test_load_market_prior_uses_last_pregame_sharp_pair(seeded):
+    from sqlalchemy import text
+
+    db, tables, _ = seeded
+
+    def _snap(conn, book_key, side, price, captured_at):
+        conn.execute(
+            text(
+                """
+                INSERT INTO odds_snapshots
+                    (event_id, book_id, market, side, price_decimal,
+                     price_american, captured_at)
+                SELECT e.id, b.id, 'moneyline', :side, :price, -110, :captured_at
+                FROM events e, books b
+                WHERE e.external_ids ->> 'mlb_game_pk' = '900001' AND b.key = :book
+                """
+            ),
+            {"side": side, "price": price, "captured_at": captured_at, "book": book_key},
+        )
+
+    ts = lambda h, m=0: datetime(2026, 7, 5, h, m, tzinfo=timezone.utc)  # noqa: E731
+    with db.begin() as conn:
+        # Early sharp pair, superseded by a later one.
+        _snap(conn, "pinnacle", "home", 1.91, ts(18))
+        _snap(conn, "pinnacle", "away", 1.91, ts(18))
+        _snap(conn, "pinnacle", "home", 1.85, ts(21))
+        _snap(conn, "pinnacle", "away", 2.10, ts(21))
+        # Incomplete pair (home only): unusable for devig.
+        _snap(conn, "pinnacle", "home", 1.80, ts(22))
+        # Soft book pair even later: not the reference (is_sharp = false).
+        _snap(conn, "bet365", "home", 1.75, ts(22, 30))
+        _snap(conn, "bet365", "away", 2.20, ts(22, 30))
+
+    prior = ds.load_market_prior(db, "moneyline")
+    assert len(prior) == 1
+    p_home_imp, p_away_imp = 1 / 1.85, 1 / 2.10
+    expected = p_home_imp / (p_home_imp + p_away_imp)
+    assert prior["market_prior_p_home"].iloc[0] == pytest.approx(expected)
+
+    assert ds.load_market_prior(db, "f5_moneyline").empty
+
+
 @pytest.mark.integration
 def test_train_f1_job_reports_sp_coverage(seeded):
     """End-to-end job path: loads pitching, computes coverage, JSON-safe."""

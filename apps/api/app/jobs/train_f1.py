@@ -26,8 +26,13 @@ from sqlalchemy.exc import ProgrammingError
 
 from app.config import get_settings
 from app.db.engine import make_engine
-from app.ml.dataset import build_training_frame, load_pitching_frame, load_results_frame
-from app.ml.train import walk_forward_report
+from app.ml.dataset import (
+    build_training_frame,
+    load_market_prior,
+    load_pitching_frame,
+    load_results_frame,
+)
+from app.ml.train import MIN_GATE_N, walk_forward_report
 
 
 def _sp_coverage(frame) -> float:
@@ -52,8 +57,11 @@ def run(
         "games_with_results": int(len(games)),
         "markets": {},
         "gate_note": (
-            "market_prior baseline unavailable (no historical odds yet); "
-            "docs/04 §2.4 gate NOT evaluated — publishing stays blocked"
+            "docs/04 §2.4 gate (log loss < market prior) is evaluated ONLY "
+            "over games with archived pregame sharp odds (own archive, "
+            f"started 2026-07-08) and only once that subset reaches n>={MIN_GATE_N} "
+            "per test season — see market_prior_subset. Until the gate is "
+            "evaluated AND beaten, publishing stays blocked"
         ),
     }
     if len(games) == 0:
@@ -79,6 +87,8 @@ def run(
 
     for market in markets:
         frame = build_training_frame(games, market, pitching)
+        prior = load_market_prior(engine, market)
+        frame = frame.merge(prior, on="event_id", how="left")
         out["markets"][market] = {
             "rows": int(len(frame)),
             "seasons": sorted(int(s) for s in frame["season"].unique()),
@@ -86,6 +96,7 @@ def run(
             # backfill this should exceed ~0.95; lower means holes in the
             # pitching archive worth investigating before quoting metrics.
             "sp_coverage": _sp_coverage(frame),
+            "rows_with_market_prior": int(frame["market_prior_p_home"].notna().sum()),
             "report": walk_forward_report(frame, min_train_seasons),
         }
     return out
@@ -115,6 +126,39 @@ def _markdown_summary(result: dict[str, Any]) -> str:
                 f"| {rep['hist_gb']['calibrated']['ece']} |"
             )
         lines.append("")
+        prior_rows = [
+            (season, rep["market_prior_subset"])
+            for season, rep in sorted(block["report"]["seasons"].items())
+            if rep.get("market_prior_subset", {}).get("n", 0) > 0
+        ]
+        if prior_rows:
+            lines.append(
+                "Subconjunto con market prior archivado (mismas filas para prior y modelos):"
+            )
+            lines.append("")
+            lines.append("| Test | n_prior | prior LL | logistic LL | hist_gb LL | gate |")
+            lines.append("|---|---|---|---|---|---|")
+            for season, sub in prior_rows:
+                gate = sub.get("gate", {})
+                verdict = (
+                    str(gate.get("beaten_by"))
+                    if gate.get("evaluated")
+                    else f"no evaluado (n<{sub['min_gate_n']})"
+                )
+                lines.append(
+                    f"| {season} | {sub['n']} "
+                    f"| {sub['market_prior']['log_loss']} "
+                    f"| {sub['logistic_calibrated']['log_loss']} "
+                    f"| {sub['hist_gb_calibrated']['log_loss']} "
+                    f"| {verdict} |"
+                )
+            lines.append("")
+        else:
+            lines.append(
+                f"_Sin juegos con market prior archivado aún "
+                f"(rows_with_market_prior={block['rows_with_market_prior']})._"
+            )
+            lines.append("")
     lines.append(f"> {result['gate_note']}")
     return "\n".join(lines)
 

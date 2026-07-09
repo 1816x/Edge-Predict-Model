@@ -129,6 +129,62 @@ def load_pitching_frame(engine: Engine, sport: str = "mlb") -> pd.DataFrame:
     return df
 
 
+_MARKET_PRIOR_SQL = """
+WITH paired AS (
+    SELECT os.event_id,
+           os.book_id,
+           os.captured_at,
+           max(os.price_decimal) FILTER (WHERE os.side = 'home') AS home_price,
+           max(os.price_decimal) FILTER (WHERE os.side = 'away') AS away_price
+    FROM odds_snapshots os
+    JOIN books b ON b.id = os.book_id
+    JOIN events e ON e.id = os.event_id
+    JOIN sports sp ON sp.id = e.sport_id
+    WHERE b.is_sharp
+      AND os.market = :market
+      AND sp.key = :sport
+      AND os.captured_at <= e.start_time_utc
+    GROUP BY 1, 2, 3
+)
+SELECT DISTINCT ON (event_id) event_id, home_price, away_price
+FROM paired
+WHERE home_price IS NOT NULL AND away_price IS NOT NULL
+ORDER BY event_id, captured_at DESC
+"""
+
+
+def load_market_prior(
+    engine: Engine, market: str, sport: str = "mlb"
+) -> pd.DataFrame:
+    """Devigged sharp-book prior per event: columns event_id, market_prior_p_home.
+
+    Uses the LAST pregame snapshot of the sharp reference book (Pinnacle,
+    docs/00 decision #6) where BOTH sides were captured at the same instant.
+    Last-before-start rather than opening line because the training vector's
+    as-of cutoff is the game start — the fairest market to compare against
+    is the one closest to that cutoff (docs/04 §2.1). Rows whose prices sum
+    to an impossible sub-1.0 overround are skipped, not repaired.
+
+    Only events archived since F0 started (2026-07-08) can have a prior:
+    the frame is expected to be TINY until the archive matures. The gate
+    logic in app/ml/train.py refuses to conclude anything below MIN_GATE_N.
+    """
+    from app.core.devig import no_vig_two_way
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(_MARKET_PRIOR_SQL), {"market": market, "sport": sport}
+        ).all()
+    priors = []
+    for row in rows:
+        try:
+            p_home, _, _ = no_vig_two_way(float(row.home_price), float(row.away_price))
+        except ValueError:
+            continue
+        priors.append({"event_id": row.event_id, "market_prior_p_home": p_home})
+    return pd.DataFrame(priors, columns=["event_id", "market_prior_p_home"])
+
+
 def _team_long_frame(games: pd.DataFrame) -> pd.DataFrame:
     """(game, team) rows with scored/allowed from the team's perspective."""
     home = pd.DataFrame(
