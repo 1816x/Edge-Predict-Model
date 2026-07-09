@@ -16,9 +16,11 @@
 -- la fila con mayor first_seen_at <= T. Un scratch tardío queda auditado
 -- como historia, no sobreescrito.
 --
--- Idempotente: safe de correr más de una vez. Sin cuerpos $$ ni ';'
--- internos: app.jobs.apply_migration separa statements con un split(';')
--- naive.
+-- Idempotente: safe de correr más de una vez. Ningún statement (NI ningún
+-- comentario) puede llevar punto-y-coma interno ni cuerpos $$, porque
+-- app.jobs.apply_migration separa statements con un split naive sobre ese
+-- carácter — un punto-y-coma dentro de un comentario parte el comentario a
+-- mitad de línea y el fragmento deja de parecer comentario.
 
 BEGIN;
 

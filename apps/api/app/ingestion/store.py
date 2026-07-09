@@ -22,7 +22,13 @@ from sqlalchemy import MetaData, Row, Table, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection, Engine
 
-from app.ingestion.parsers import GameResult, OddsEvent, OddsOutcome, ScheduledGame
+from app.ingestion.parsers import (
+    GameResult,
+    OddsEvent,
+    OddsOutcome,
+    PitchingLine,
+    ScheduledGame,
+)
 
 INGESTION_TABLES = (
     "sports",
@@ -31,6 +37,18 @@ INGESTION_TABLES = (
     "events",
     "event_results",
     "odds_snapshots",
+)
+
+# Migration 003 tables, reflected separately: a database that has not run
+# the migration yet must not break sync_schedule/snapshot_odds reflection
+# in the window between merging code and applying the migration.
+PITCHING_TABLES = (
+    "sports",
+    "teams",
+    "events",
+    "players",
+    "pitching_game_logs",
+    "event_probables",
 )
 
 EVENT_MATCH_WINDOW = timedelta(hours=3)
@@ -410,6 +428,134 @@ def bulk_upsert_schedule_chunk(
         counts["results_upserted"] = len(result_rows)
 
     return counts
+
+
+def load_player_cache(conn: Connection, t: dict[str, Table]) -> dict[int, uuid.UUID]:
+    """All known players keyed by MLB person id (pitching backfill hot path)."""
+    players = t["players"]
+    rows = conn.execute(select(players.c.mlb_person_id, players.c.id)).all()
+    return {row.mlb_person_id: row.id for row in rows}
+
+
+def bulk_upsert_players(
+    conn: Connection,
+    t: dict[str, Table],
+    sport_id: uuid.UUID,
+    entries: list[dict],
+    player_cache: dict[int, uuid.UUID],
+) -> dict[int, uuid.UUID]:
+    """Upsert players by MLB person id; returns {mlb_person_id: player_id}.
+
+    ``entries`` dicts carry mlb_person_id, full_name and pitch_hand (may be
+    None). A known hand is never clobbered by a payload that omits it:
+    the conflict action COALESCEs the incoming hand with the stored one.
+    Updates ``player_cache`` in place.
+    """
+    if not entries:
+        return player_cache
+    players = t["players"]
+    # Dedupe by person id, preferring rows that DO carry a hand.
+    deduped: dict[int, dict] = {}
+    for e in entries:
+        pid = int(e["mlb_person_id"])
+        held = deduped.get(pid)
+        if held is None or (held.get("pitch_hand") is None and e.get("pitch_hand")):
+            deduped[pid] = e
+    rows = [
+        {
+            "sport_id": sport_id,
+            "mlb_person_id": pid,
+            "full_name": e["full_name"],
+            "pitch_hand": e.get("pitch_hand"),
+        }
+        for pid, e in deduped.items()
+    ]
+    stmt = pg_insert(players).values(rows)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["mlb_person_id"],
+        set_={
+            "full_name": stmt.excluded.full_name,
+            "pitch_hand": func.coalesce(stmt.excluded.pitch_hand, players.c.pitch_hand),
+        },
+    ).returning(players.c.mlb_person_id, players.c.id)
+    for person_id, player_id in conn.execute(stmt):
+        player_cache[person_id] = player_id
+    return player_cache
+
+
+def bulk_upsert_pitching_logs(
+    conn: Connection,
+    t: dict[str, Table],
+    event_id: uuid.UUID,
+    home_team_id: uuid.UUID,
+    away_team_id: uuid.UUID,
+    lines: list[PitchingLine],
+    player_cache: dict[int, uuid.UUID],
+) -> int:
+    """Upsert one game's pitching lines (DO UPDATE: MLB corrects boxscores)."""
+    if not lines:
+        return 0
+    logs = t["pitching_game_logs"]
+    rows = [
+        {
+            "event_id": event_id,
+            "player_id": player_cache[line.mlb_person_id],
+            "team_id": home_team_id if line.is_home else away_team_id,
+            "is_home": line.is_home,
+            "is_starter": line.is_starter,
+            "outs_recorded": line.outs_recorded,
+            "batters_faced": line.batters_faced,
+            "strikeouts": line.strikeouts,
+            "walks": line.walks,
+            "hit_batsmen": line.hit_batsmen,
+            "home_runs": line.home_runs,
+            "fly_outs": line.fly_outs,
+            "ground_outs": line.ground_outs,
+            "sac_flies": line.sac_flies,
+            "pitches_thrown": line.pitches_thrown,
+            "source": "mlb_stats_api",
+        }
+        for line in lines
+    ]
+    stmt = pg_insert(logs).values(rows)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["event_id", "player_id"],
+        set_={
+            col: getattr(stmt.excluded, col)
+            for col in (
+                "team_id", "is_home", "is_starter", "outs_recorded",
+                "batters_faced", "strikeouts", "walks", "hit_batsmen",
+                "home_runs", "fly_outs", "ground_outs", "sac_flies",
+                "pitches_thrown", "source",
+            )
+        },
+    )
+    conn.execute(stmt)
+    return len(rows)
+
+
+def record_probables(
+    conn: Connection,
+    t: dict[str, Table],
+    entries: list[dict],
+) -> int:
+    """Append newly-seen probables; repeats are no-ops (DO NOTHING).
+
+    ``entries`` dicts carry event_id, side ('home'/'away'), player_id and
+    first_seen_at. A CHANGED probable simply inserts a new row — the history
+    of who was announced when is the point of the table. Returns how many
+    rows were actually new.
+    """
+    if not entries:
+        return 0
+    probables = t["event_probables"]
+    result = conn.execute(
+        pg_insert(probables)
+        .values(entries)
+        .on_conflict_do_nothing()
+        .returning(probables.c.id)
+    )
+    return len(result.fetchall())
 
 
 def insert_odds_snapshots(

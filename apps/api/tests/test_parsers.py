@@ -2,7 +2,12 @@
 
 from datetime import datetime, timezone
 
-from app.ingestion.parsers import OddsEvent, parse_odds_event, parse_schedule
+from app.ingestion.parsers import (
+    OddsEvent,
+    parse_boxscore_pitching,
+    parse_odds_event,
+    parse_schedule,
+)
 
 from conftest import load_fixture
 
@@ -69,6 +74,10 @@ class TestParseSchedule:
         assert g1.home_mlb_id == 111 and g1.away_mlb_id == 147
         assert g1.home_probable == "Nick Pivetta"
         assert g1.away_probable == "Gerrit Cole"
+        # Person ids are the durable identity event_probables stores.
+        assert g1.home_probable_id == 601713
+        assert g1.away_probable_id == 543037
+        assert games[2].home_probable_id is None
         assert g1.start_time == datetime(2026, 7, 8, 23, 10, tzinfo=timezone.utc)
         # Doubleheader nightcap has no probables announced yet.
         assert games[2].home_probable is None
@@ -103,3 +112,81 @@ class TestParseSchedule:
         assert one_game("Final", "Postponed") == "postponed"
         assert one_game("Final", "Cancelled") == "cancelled"
         assert one_game("SomethingNew", "Warmup") == "scheduled"
+
+
+class TestParseBoxscorePitching:
+    def _parsed(self):
+        return parse_boxscore_pitching(load_fixture("mlb_boxscore.json"))
+
+    def test_all_pitching_lines_kept_and_position_players_ignored(self):
+        box = self._parsed()
+        # Home starter + home reliever + away starter; the away reliever is
+        # dropped (missing battersFaced) and the catcher never pitched.
+        assert {l.mlb_person_id for l in box.lines} == {608566, 700001, 700002}
+
+    def test_starter_flag_from_games_started(self):
+        box = self._parsed()
+        by_id = {l.mlb_person_id: l for l in box.lines}
+        assert by_id[608566].is_starter is True
+        assert by_id[700001].is_starter is False
+
+    def test_starter_fallback_to_appearance_order(self):
+        # No away line carries gamesStarted: the first id in the team's
+        # `pitchers` list is the starter, and the fallback is reported.
+        box = self._parsed()
+        assert next(l for l in box.lines if l.mlb_person_id == 700002).is_starter
+        assert "away:starter_from_appearance_order:700002" in box.anomalies
+
+    def test_outs_parsed_from_innings_pitched_notation(self):
+        # "5.2" is 5 innings + 2 outs = 17 outs, NOT five-point-two innings.
+        box = self._parsed()
+        line = next(l for l in box.lines if l.mlb_person_id == 700002)
+        assert line.outs_recorded == 17
+
+    def test_outs_stat_preferred_over_innings_pitched(self):
+        box = self._parsed()
+        assert next(l for l in box.lines if l.mlb_person_id == 608566).outs_recorded == 18
+
+    def test_line_missing_denominators_is_dropped_and_reported(self):
+        box = self._parsed()
+        assert all(l.mlb_person_id != 700003 for l in box.lines)
+        assert any(a.startswith("away:700003:missing:") for a in box.anomalies)
+
+    def test_nullable_stats_stay_none_never_zero(self):
+        box = self._parsed()
+        reliever = next(l for l in box.lines if l.mlb_person_id == 700001)
+        assert reliever.pitches_thrown is None
+        assert reliever.sac_flies is None
+        assert reliever.ground_outs == 3
+
+    def test_pitch_hand_extracted_when_present_else_none(self):
+        box = self._parsed()
+        by_id = {l.mlb_person_id: l for l in box.lines}
+        assert by_id[608566].pitch_hand == "R"
+        assert by_id[700001].pitch_hand is None
+
+    def test_missing_or_defaulted_counting_stats(self):
+        box = self._parsed()
+        starter = next(l for l in box.lines if l.mlb_person_id == 700002)
+        # hitBatsmen omitted -> 0 (a real omission means none happened)...
+        assert starter.hit_batsmen == 0
+        assert starter.home_runs == 2
+        # ...but fly balls omitted -> None (xFIP must know it's unrecorded).
+        assert starter.fly_outs is None
+
+    def test_two_games_started_flags_keep_first_in_appearance_order(self):
+        payload = load_fixture("mlb_boxscore.json")
+        home = payload["teams"]["home"]["players"]
+        home["ID700001"]["stats"]["pitching"]["gamesStarted"] = 1
+        box = parse_boxscore_pitching(payload)
+        by_id = {l.mlb_person_id: l for l in box.lines if l.is_home}
+        assert by_id[608566].is_starter is True
+        assert by_id[700001].is_starter is False
+        assert "home:starter_count:2" in box.anomalies
+
+    def test_empty_payload_yields_no_lines_and_reports(self):
+        box = parse_boxscore_pitching({"teams": {"home": {}, "away": {}}})
+        assert box.lines == ()
+        # No pitching data at all is not silently OK.
+        assert "home:starter_count:0" in box.anomalies
+        assert "away:starter_count:0" in box.anomalies
