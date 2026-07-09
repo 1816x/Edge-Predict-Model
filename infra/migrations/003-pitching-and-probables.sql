@@ -11,10 +11,12 @@
 -- pitchers del juego, con flag is_starter — el costo marginal es cero y
 -- desbloquea el bloque de bullpen (§1.4) sin re-ingerir.
 --
--- event_probables es append-por-cambio: cada (evento, lado, pitcher) se
--- registra una vez con su first_seen_at. El "probable vigente as-of T" es
--- la fila con mayor first_seen_at <= T. Un scratch tardío queda auditado
--- como historia, no sobreescrito.
+-- event_probables es append-por-cambio: se inserta una fila cada vez que
+-- el probable anunciado DIFIERE del vigente (dedupe en la capa store, no
+-- por constraint: un re-anuncio X->Y->X necesita registrar la vuelta de X
+-- o el as-of devolvería a Y para siempre). El "probable vigente as-of T"
+-- es la fila con mayor first_seen_at <= T. Un scratch tardío queda
+-- auditado como historia, no sobreescrito.
 --
 -- Idempotente: safe de correr más de una vez. Ningún statement (NI ningún
 -- comentario) puede llevar punto-y-coma interno ni cuerpos $$, porque
@@ -65,8 +67,7 @@ CREATE TABLE IF NOT EXISTS event_probables (
     side          text NOT NULL CHECK (side IN ('home', 'away')),
     player_id     uuid NOT NULL REFERENCES players (id),
     first_seen_at timestamptz NOT NULL DEFAULT now(),
-    created_at    timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (event_id, side, player_id)
+    created_at    timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_event_probables_event

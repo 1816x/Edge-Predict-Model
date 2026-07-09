@@ -169,6 +169,14 @@ def test_sync_schedule_archives_probable_history(db):
     third = sync_schedule.run("2026-07-08", client=client, engine=db)
     assert third["probables"] == {"seen": 2, "new": 1}
 
+    # Re-announcement (X -> Y -> X, rain-shuffled rotation): X's return MUST
+    # create a new row, or the as-of resolution would answer Y forever.
+    client.schedule_games[0]["teams"]["home"]["probablePitcher"] = {
+        "id": 608566, "fullName": "Kutter Crawford",
+    }
+    fourth = sync_schedule.run("2026-07-08", client=client, engine=db)
+    assert fourth["probables"] == {"seen": 2, "new": 1}
+
     with db.connect() as conn:
         rows = conn.execute(
             text(
@@ -179,9 +187,52 @@ def test_sync_schedule_archives_probable_history(db):
                 """
             )
         ).all()
-    assert {(r.side, r.mlb_person_id) for r in rows} == {
-        ("home", 608566), ("away", 700002), ("home", 700001),
-    }
+        latest_home = conn.execute(
+            text(
+                """
+                SELECT p.mlb_person_id
+                FROM event_probables ep JOIN players p ON p.id = ep.player_id
+                WHERE ep.side = 'home'
+                ORDER BY ep.first_seen_at DESC LIMIT 1
+                """
+            )
+        ).scalar_one()
+    assert len(rows) == 4
+    assert latest_home == 608566  # X vigente tras el re-anuncio
+
+
+@pytest.mark.integration
+def test_placeholder_name_never_clobbers_real_name(db):
+    from app.ingestion import store
+
+    _seed_events(db, [])
+    tables = store.reflect_tables(db, store.PITCHING_TABLES)
+    cache: dict[int, object] = {}
+    with db.begin() as conn:
+        sport_id = store.get_sport_id(conn, tables)
+        store.bulk_upsert_players(
+            conn, tables, sport_id,
+            [{"mlb_person_id": 1, "full_name": "Zack Wheeler", "pitch_hand": "R"}],
+            cache,
+        )
+        # A schedule payload that omits fullName fabricates a placeholder;
+        # it must not destroy the real name already on file.
+        store.bulk_upsert_players(
+            conn, tables, sport_id,
+            [{"mlb_person_id": 1, "full_name": "MLB person 1", "pitch_hand": None}],
+            cache,
+        )
+        # A brand-new player with no known name DOES keep the placeholder.
+        store.bulk_upsert_players(
+            conn, tables, sport_id,
+            [{"mlb_person_id": 2, "full_name": "MLB person 2", "pitch_hand": None}],
+            cache,
+        )
+    with db.connect() as conn:
+        names = dict(
+            conn.execute(text("SELECT mlb_person_id, full_name FROM players")).all()
+        )
+    assert names == {1: "Zack Wheeler", 2: "MLB person 2"}
 
 
 @pytest.mark.integration

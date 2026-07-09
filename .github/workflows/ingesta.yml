@@ -48,11 +48,15 @@ on:
         type: string
         default: ''
 
-# Grupos separados: los crons programados nunca desplazan de la cola a un
-# backfill/entrenamiento manual (los jobs son idempotentes y tocan tablas
-# distintas, correr en paralelo es seguro).
+# Grupos separados por tipo de evento Y por schedule: los crons programados
+# nunca desplazan de la cola a un backfill/entrenamiento manual, y el cron
+# diario de mantenimiento nunca compite con los de snapshots (GitHub cancela
+# la corrida PENDIENTE de un grupo cuando llega una tercera; con grupos
+# separados eso solo puede pasar entre corridas del mismo cron, donde la
+# nueva es un reemplazo válido). Los jobs son idempotentes y tocan tablas
+# distintas: correr en paralelo es seguro.
 concurrency:
-  group: ingesta-${{ github.event_name }}
+  group: ingesta-${{ github.event_name }}-${{ github.event.schedule }}
   cancel-in-progress: false
 
 permissions:
@@ -105,13 +109,23 @@ jobs:
             esac
           elif [ "$SCHEDULE" = "17 14 * * *" ]; then
             # Mantenimiento diario del corpus: slate de hoy (con probables),
-            # resultados finales de ayer y game logs de pitcheo de ayer.
+            # resultados y game logs de los últimos 3 días (lookback: una
+            # corrida saltada por GitHub se auto-repara al día siguiente;
+            # skip-existing hace el re-proceso casi gratis), y auditoría de
+            # huecos del archivo de odds de ayer — en rojo si hubo huecos.
             YDAY=$(date -u -d "yesterday" +%F)
+            START=$(date -u -d "3 days ago" +%F)
             python -m app.jobs.sync_schedule
-            python -m app.jobs.backfill_results --start-date "$YDAY" --end-date "$YDAY"
-            python -m app.jobs.backfill_pitching
+            python -m app.jobs.backfill_results --start-date "$START" --end-date "$YDAY"
+            python -m app.jobs.backfill_pitching --start-date "$START" --end-date "$YDAY"
+            python -m app.jobs.audit_snapshots --start-date "$YDAY" --end-date "$YDAY" --fail-on-gaps
           elif [ "$SCHEDULE" = "7,37 16-23,0-3 * * *" ]; then
             python -m app.jobs.snapshot_odds --closing-window-min 30
           else
+            # Antes de cada snapshot, refrescar slate y probables (1 llamada
+            # MLB gratis): auto-repara el slate si el cron diario se saltó y
+            # archiva los cambios de probable intradía (scratches) — justo
+            # los eventos donde la línea más se mueve.
+            python -m app.jobs.sync_schedule
             python -m app.jobs.snapshot_odds
           fi

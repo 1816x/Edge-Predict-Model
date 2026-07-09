@@ -205,19 +205,21 @@ CREATE TABLE pitching_game_logs (
     PRIMARY KEY (event_id, player_id)
 );
 
--- Probable starters as an append-per-change history: each (event, side,
--- pitcher) is recorded once with when it was first seen. The probable
--- "as-of T" is the row with the greatest first_seen_at <= T — a late
--- scratch stays audited as history instead of being overwritten (same
--- archive-from-day-one philosophy as odds_snapshots).
+-- Probable starters as an append-per-change history: a row is inserted
+-- whenever the announced probable DIFFERS from the currently-recorded one
+-- (dedupe lives in the store layer, NOT in a unique constraint: a
+-- re-announcement X -> Y -> X must record X's return or the as-of
+-- resolution would answer Y forever). The probable "as-of T" is the row
+-- with the greatest first_seen_at <= T — a late scratch stays audited as
+-- history instead of being overwritten (same archive-from-day-one
+-- philosophy as odds_snapshots).
 CREATE TABLE event_probables (
     id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     event_id      uuid NOT NULL REFERENCES events (id),
     side          text NOT NULL CHECK (side IN ('home', 'away')),
     player_id     uuid NOT NULL REFERENCES players (id),
     first_seen_at timestamptz NOT NULL DEFAULT now(),
-    created_at    timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (event_id, side, player_id)
+    created_at    timestamptz NOT NULL DEFAULT now()
 );
 
 -- ============================================================================

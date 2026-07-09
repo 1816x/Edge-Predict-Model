@@ -32,7 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import Table, func, select
@@ -82,6 +82,15 @@ FEATURE_TABLES = (
 def _round(value: float | None, digits: int = 4) -> float | None:
     """Stable rounding so the canonical hash never flaps on float noise."""
     return None if value is None else round(value, digits)
+
+
+def _utc_date(ts: datetime):
+    """Calendar date in UTC. psycopg localizes timestamptz to the SESSION
+    time zone, so a bare .date()/.year would follow whatever the server is
+    configured to — while the bulk dataset path is hard-pinned to UTC. Every
+    date/year comparison in this module goes through UTC to keep the two
+    paths identical regardless of database configuration."""
+    return ts.astimezone(timezone.utc).date()
 
 
 def _team_form(
@@ -151,7 +160,7 @@ def _team_form(
         "f5_games_30d": f5_games,
         "f5_runs_pg_30d": _round(f5_for / f5_games) if f5_games else None,
         "f5_runs_allowed_pg_30d": _round(f5_against / f5_games) if f5_games else None,
-        "rest_days": (event_start.date() - last_game_start.date()).days
+        "rest_days": (_utc_date(event_start) - _utc_date(last_game_start)).days
         if last_game_start
         else None,
         "games_last_7d": games_last_7d,
@@ -298,7 +307,7 @@ def _starter_block(
     if not rows:
         return block
 
-    rest = (event_start.date() - rows[0].start_time_utc.date()).days
+    rest = (_utc_date(event_start) - _utc_date(rows[0].start_time_utc)).days
     if rest <= SP_MAX_REST_DAYS:
         block["sp_days_rest"] = rest
 
@@ -331,7 +340,8 @@ def _starter_block(
             ),
         )
 
-    season = [r for r in rows if r.start_time_utc.year == event_start.year]
+    season_year = _utc_date(event_start).year
+    season = [r for r in rows if _utc_date(r.start_time_utc).year == season_year]
     block["sp_kbb_pct_l5_starts"], block["sp_xfip_l5_starts"] = _rates(
         rows[:SP_LAST_STARTS]
     )

@@ -18,7 +18,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta
 
-from sqlalchemy import MetaData, Row, Table, func, select, update
+from sqlalchemy import MetaData, Row, Table, case, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection, Engine
 
@@ -474,7 +474,13 @@ def bulk_upsert_players(
     stmt = stmt.on_conflict_do_update(
         index_elements=["mlb_person_id"],
         set_={
-            "full_name": stmt.excluded.full_name,
+            # Callers fabricate 'MLB person {id}' when a payload omits the
+            # name (full_name is NOT NULL); that placeholder must never
+            # overwrite a real name already on file.
+            "full_name": case(
+                (stmt.excluded.full_name.like("MLB person %"), players.c.full_name),
+                else_=stmt.excluded.full_name,
+            ),
             "pitch_hand": func.coalesce(stmt.excluded.pitch_hand, players.c.pitch_hand),
         },
     ).returning(players.c.mlb_person_id, players.c.id)
@@ -539,23 +545,40 @@ def record_probables(
     t: dict[str, Table],
     entries: list[dict],
 ) -> int:
-    """Append newly-seen probables; repeats are no-ops (DO NOTHING).
+    """Append probables that DIFFER from the currently-recorded one.
 
     ``entries`` dicts carry event_id, side ('home'/'away'), player_id and
-    first_seen_at. A CHANGED probable simply inserts a new row — the history
-    of who was announced when is the point of the table. Returns how many
-    rows were actually new.
+    first_seen_at. Dedupe is against the LATEST recorded probable per
+    (event, side) — deliberately NOT a unique constraint on the pitcher:
+    a re-announcement (X scratched for Y, then X returns) must insert a
+    new X row, or the as-of resolution would answer Y forever. Re-running
+    the same slate inserts nothing. Returns how many rows were new.
     """
     if not entries:
         return 0
     probables = t["event_probables"]
-    result = conn.execute(
-        pg_insert(probables)
-        .values(entries)
-        .on_conflict_do_nothing()
-        .returning(probables.c.id)
-    )
-    return len(result.fetchall())
+    rows = conn.execute(
+        select(
+            probables.c.event_id,
+            probables.c.side,
+            probables.c.player_id,
+            probables.c.first_seen_at,
+        ).where(probables.c.event_id.in_(list({e["event_id"] for e in entries})))
+    ).all()
+    current: dict[tuple, tuple] = {}
+    for row in rows:
+        key = (row.event_id, row.side)
+        if key not in current or row.first_seen_at > current[key][1]:
+            current[key] = (row.player_id, row.first_seen_at)
+    to_insert = [
+        e
+        for e in entries
+        if current.get((e["event_id"], e["side"]), (None, None))[0] != e["player_id"]
+    ]
+    if not to_insert:
+        return 0
+    conn.execute(probables.insert().values(to_insert))
+    return len(to_insert)
 
 
 def insert_odds_snapshots(

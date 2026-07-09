@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -222,9 +223,15 @@ if __name__ == "__main__":
     parser.add_argument("--start-date", help="YYYY-MM-DD (default: 14 días atrás)")
     parser.add_argument("--end-date", help="YYYY-MM-DD (default: hoy UTC)")
     parser.add_argument("--max-gap-hours", type=float, default=DEFAULT_MAX_GAP_HOURS)
+    parser.add_argument(
+        "--fail-on-gaps", action="store_true",
+        help="exit 2 si hay huecos: pone en rojo la corrida del cron que audita",
+    )
     args = parser.parse_args()
     result = run(
         args.start_date, args.end_date, max_gap_hours=args.max_gap_hours
     )
     print(json.dumps(result))
     print(_markdown_summary(result))
+    if args.fail_on_gaps and result["events_with_gaps"] > 0:
+        sys.exit(2)

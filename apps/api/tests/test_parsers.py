@@ -184,6 +184,18 @@ class TestParseBoxscorePitching:
         assert by_id[700001].is_starter is False
         assert "home:starter_count:2" in box.anomalies
 
+    def test_fallback_never_crowns_a_reliever(self):
+        # The true starter's line is unparseable (empty pitching stats) and
+        # no line carries gamesStarted: crowning the NEXT pitcher in
+        # appearance order would flag a reliever as starter. Report no
+        # starter instead.
+        payload = load_fixture("mlb_boxscore.json")
+        away = payload["teams"]["away"]["players"]
+        away["ID700002"]["stats"]["pitching"] = {}
+        box = parse_boxscore_pitching(payload)
+        assert not any(l.is_starter for l in box.lines if not l.is_home)
+        assert "away:starter_count:0" in box.anomalies
+
     def test_empty_payload_yields_no_lines_and_reports(self):
         box = parse_boxscore_pitching({"teams": {"home": {}, "away": {}}})
         assert box.lines == ()

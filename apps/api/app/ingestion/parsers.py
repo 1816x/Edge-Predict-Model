@@ -331,8 +331,11 @@ def parse_boxscore_pitching(payload: dict[str, Any]) -> BoxscorePitching:
 
         starters = [pid for pid, r in raw.items() if (r["stats"].get("gamesStarted") or 0) >= 1]
         if not starters and raw:
-            fallback = next((pid for pid in appearance_order if pid in raw), None)
-            if fallback is not None:
+            # Only the FIRST pitcher in appearance order can be the starter.
+            # If his line didn't parse, crowning the next one would flag a
+            # reliever as starter — worse than reporting no starter at all.
+            fallback = appearance_order[0] if appearance_order else None
+            if fallback is not None and fallback in raw:
                 starters = [fallback]
                 anomalies.append(f"{side_key}:starter_from_appearance_order:{fallback}")
         if len(starters) != 1:

@@ -32,6 +32,7 @@ from typing import Any
 
 from sqlalchemy import select, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import InvalidRequestError
 
 from app.config import get_settings
 from app.db.engine import make_engine
@@ -88,7 +89,16 @@ def run(
     if end < start:
         raise ValueError(f"end_date {end} is before start_date {start}")
 
-    tables = store.reflect_tables(engine, store.PITCHING_TABLES)
+    try:
+        tables = store.reflect_tables(engine, store.PITCHING_TABLES)
+    except InvalidRequestError:
+        # Same degradation contract as sync_schedule: in the window between
+        # merging code and applying migration 003, the daily cron must warn,
+        # not paint every run red.
+        return {
+            "job": "backfill_pitching",
+            "skipped": "players/pitching tables missing; apply migration 003",
+        }
     summary: dict[str, Any] = {
         "job": "backfill_pitching",
         "start_date": start.isoformat(),
@@ -213,11 +223,23 @@ def run(
         ]
         if need_hands:
             for pid, hand in _resolve_hands(client, need_hands).items():
-                player_entries[pid]["pitch_hand"] = hand
-                summary["hands_backfilled"] += 1
+                # /people can return canonicalized ids that were never asked
+                # for (merged person records); only take what we track.
+                if pid in player_entries:
+                    player_entries[pid]["pitch_hand"] = hand
+                    summary["hands_backfilled"] += 1
 
         if chunk_lines:
             with engine.begin() as conn:
+                if force:
+                    # A corrected boxscore can REMOVE a line (wrongly credited
+                    # pitcher); upserts alone never converge on that, so a
+                    # forced re-fetch replaces each game's rows wholesale.
+                    conn.execute(
+                        logs_t.delete().where(
+                            logs_t.c.event_id.in_([e.id for e, _ in chunk_lines])
+                        )
+                    )
                 store.bulk_upsert_players(
                     conn, tables, store.get_sport_id(conn, tables),
                     list(player_entries.values()), player_cache,
