@@ -93,13 +93,30 @@ class MlbClient:
         """Boxscore for a finished (or live) game.
 
         Calls ``GET /api/v1/game/{gamePk}/boxscore``. Used to grade picks
-        (full-game and F5 results) after games finish.
+        (full-game and F5 results) after games finish, and by the pitching
+        backfill for per-game pitching lines.
 
         Raises:
             MlbApiError: on non-2xx response.
         """
         with httpx.Client(base_url=BASE_URL, timeout=self._timeout) as client:
             resp = client.get(f"/api/v1/game/{game_pk}/boxscore")
+            if resp.status_code != 200:
+                raise MlbApiError(f"MLB Stats API returned {resp.status_code}: {resp.text[:500]}")
+            return resp.json()
+
+    def get_people(self, person_ids: list[int]) -> dict[str, Any]:
+        """Bio data for up to ~100 players in one call.
+
+        Calls ``GET /api/v1/people?personIds=1,2,3``. The pitching backfill
+        uses it to resolve pitch hands, which boxscore payloads omit.
+
+        Raises:
+            MlbApiError: on non-2xx response.
+        """
+        params = {"personIds": ",".join(str(pid) for pid in person_ids)}
+        with httpx.Client(base_url=BASE_URL, timeout=self._timeout) as client:
+            resp = client.get("/api/v1/people", params=params)
             if resp.status_code != 200:
                 raise MlbApiError(f"MLB Stats API returned {resp.status_code}: {resp.text[:500]}")
             return resp.json()
