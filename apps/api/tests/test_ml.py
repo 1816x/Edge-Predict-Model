@@ -195,6 +195,25 @@ class TestStarterFeatures:
 
 
 @pytest.mark.integration
+def test_train_f1_job_reports_sp_coverage(seeded):
+    """End-to-end job path: loads pitching, computes coverage, JSON-safe."""
+    import json
+
+    from app.jobs import train_f1
+
+    db, _, _ = seeded
+    result = train_f1.run(engine=db)
+    json.dumps(result)
+    block = result["markets"]["moneyline"]
+    # 5 finished games; only the July 6th one has BOTH starters with prior
+    # history (SP1's June 5th start has no priors at all).
+    assert block["rows"] == 5
+    assert block["sp_coverage"] == 0.2
+    # Not enough seasons to test anything: the report stays honest and empty.
+    assert block["report"]["seasons"] == {}
+
+
+@pytest.mark.integration
 def test_bulk_features_match_online_builder(seeded):
     """The training dataset and the online builder must produce IDENTICAL
     numbers for the same game — otherwise train/serve skew poisons F1."""
