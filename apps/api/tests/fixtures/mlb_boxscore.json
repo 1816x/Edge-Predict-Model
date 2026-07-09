@@ -1,0 +1,90 @@
+{
+  "teams": {
+    "home": {
+      "team": {"id": 111, "name": "Boston Red Sox"},
+      "pitchers": [608566, 700001],
+      "players": {
+        "ID608566": {
+          "person": {"id": 608566, "fullName": "Kutter Crawford", "pitchHand": {"code": "R"}},
+          "position": {"code": "1", "abbreviation": "P"},
+          "stats": {
+            "batting": {},
+            "pitching": {
+              "gamesStarted": 1,
+              "inningsPitched": "6.0",
+              "outs": 18,
+              "battersFaced": 24,
+              "strikeOuts": 7,
+              "baseOnBalls": 2,
+              "hitBatsmen": 1,
+              "homeRuns": 1,
+              "flyOuts": 5,
+              "groundOuts": 6,
+              "sacFlies": 1,
+              "numberOfPitches": 95
+            }
+          }
+        },
+        "ID700001": {
+          "person": {"id": 700001, "fullName": "Bullpen Arm"},
+          "position": {"code": "1", "abbreviation": "P"},
+          "stats": {
+            "batting": {},
+            "pitching": {
+              "gamesStarted": 0,
+              "inningsPitched": "3.0",
+              "outs": 9,
+              "battersFaced": 11,
+              "strikeOuts": 4,
+              "baseOnBalls": 0,
+              "hitBatsmen": 0,
+              "homeRuns": 0,
+              "flyOuts": 2,
+              "groundOuts": 3
+            }
+          }
+        },
+        "ID700010": {
+          "person": {"id": 700010, "fullName": "Everyday Catcher"},
+          "position": {"code": "2", "abbreviation": "C"},
+          "stats": {
+            "batting": {"hits": 2, "atBats": 4},
+            "pitching": {}
+          }
+        }
+      }
+    },
+    "away": {
+      "team": {"id": 147, "name": "New York Yankees"},
+      "pitchers": [700002, 700003],
+      "players": {
+        "ID700002": {
+          "person": {"id": 700002, "fullName": "Old Data Lefty"},
+          "position": {"code": "1", "abbreviation": "P"},
+          "stats": {
+            "batting": {},
+            "pitching": {
+              "inningsPitched": "5.2",
+              "battersFaced": 23,
+              "strikeOuts": 5,
+              "baseOnBalls": 3,
+              "homeRuns": 2
+            }
+          }
+        },
+        "ID700003": {
+          "person": {"id": 700003, "fullName": "Broken Line Reliever"},
+          "position": {"code": "1", "abbreviation": "P"},
+          "stats": {
+            "batting": {},
+            "pitching": {
+              "inningsPitched": "2.1",
+              "strikeOuts": 2,
+              "baseOnBalls": 1
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -104,6 +104,205 @@ class TestWalkForward:
         with pytest.raises(ValueError, match="unknown market"):
             ds.build_training_frame(_synthetic_games(1, 10), "spreads")
 
+    def test_no_pitching_data_degrades_to_nan_and_still_trains(self):
+        # Before the pitching backfill runs, sp_* columns are 100% NaN; the
+        # walk-forward must impute (median -> 0.0 fallback) and not crash.
+        games = _synthetic_games()
+        frame = ds.build_training_frame(games, "moneyline", pitching=None)
+        sp_cols = [c for c in ds.FEATURE_COLUMNS if "_sp_" in c]
+        assert len(sp_cols) == 14
+        assert frame[sp_cols].isna().all().all()
+        report = tr.walk_forward_report(frame, min_train_seasons=4)
+        assert sorted(report["seasons"]) == [2022, 2023]
+
+
+def _synthetic_pitching() -> pd.DataFrame:
+    """One pitcher ('the league'): a 2023 start + five 2024 starts + target.
+
+    2023-09-20: K10 BB0 BF30 outs21 HR0 FB(5+0+0) pitches100
+    2024 (Apr 1/6/11/16/21): K6 BB2 BF25 outs18 HR1 fly4 sac1 pitches90 each
+    2024-04-26: the target start (its own stats never enter its features).
+    """
+    rows = [
+        dict(event_id="g0", player_id="p1", is_home=True,
+             start_time_utc=datetime(2023, 9, 20, 23, 0, tzinfo=timezone.utc),
+             outs_recorded=21, batters_faced=30, strikeouts=10, walks=0,
+             hit_batsmen=0, home_runs=0, fly_outs=5, sac_flies=0,
+             pitches_thrown=100, pitch_hand="L"),
+    ]
+    for n, day in enumerate((1, 6, 11, 16, 21, 26)):
+        rows.append(
+            dict(event_id=f"g{n + 1}", player_id="p1", is_home=True,
+                 start_time_utc=datetime(2024, 4, day, 23, 0, tzinfo=timezone.utc),
+                 outs_recorded=18, batters_faced=25, strikeouts=6, walks=2,
+                 hit_batsmen=0, home_runs=1, fly_outs=4, sac_flies=1,
+                 pitches_thrown=90, pitch_hand="L"),
+        )
+    return pd.DataFrame(rows)
+
+
+class TestStarterFeatures:
+    def _by_event(self):
+        feats = ds._starter_features(_synthetic_pitching())
+        return {row["event_id"]: row for _, row in feats.iterrows()}
+
+    def test_first_career_start_has_no_history(self):
+        row = self._by_event()["g0"]
+        for name in ds.SP_FEATURE_NAMES:
+            if name != "sp_is_lhp":
+                assert pd.isna(row[name]), name
+
+    def test_l5_window_and_shrinkage_hand_computed(self):
+        # Target 04-26: last 5 = the 2024 starts. K-BB sum 20, BF 125.
+        # League as-of = all 6 priors: lg_kbb = 30/155.
+        row = self._by_event()["g6"]
+        lg_kbb = 30 / 155
+        expected = (20 + 60 * lg_kbb) / (125 + 60)
+        assert row["sp_kbb_pct_l5_starts"] == pytest.approx(round(expected, 4))
+        # All five l5 starts are 2024: season == l5.
+        assert row["sp_kbb_pct_season"] == row["sp_kbb_pct_l5_starts"]
+
+    def test_xfip_core_hand_computed(self):
+        # League: HR 5, FB 35, K 40, BB+HBP 10, IP 37.
+        row = self._by_event()["g6"]
+        lg_hrfb = 5 / 35
+        lg_core = (13 * 5 + 3 * 10 - 2 * 40) / 37
+        expected = (13 * 30 * lg_hrfb + 3 * 10 - 2 * 30 + 15 * lg_core) / (30 + 15)
+        assert row["sp_xfip_l5_starts"] == pytest.approx(round(expected, 4))
+
+    def test_season_boundary_excludes_prior_year(self):
+        # First 2024 start: l5 sees the 2023-09-20 start, season(2024) is
+        # empty -> season features stay NaN while l5 is computed.
+        row = self._by_event()["g1"]
+        lg_kbb = 10 / 30  # league as-of = only the 2023 start
+        expected = (10 + 60 * lg_kbb) / (30 + 60)
+        assert row["sp_kbb_pct_l5_starts"] == pytest.approx(round(expected, 4))
+        assert pd.isna(row["sp_kbb_pct_season"])
+
+    def test_rest_days_none_after_long_layoff(self):
+        by_event = self._by_event()
+        # 194 days since 2023-09-20: IL/offseason, not "rest".
+        assert pd.isna(by_event["g1"]["sp_days_rest"])
+        assert by_event["g6"]["sp_days_rest"] == 5
+
+    def test_pitch_count_l2(self):
+        by_event = self._by_event()
+        assert by_event["g6"]["sp_pitch_count_l2_starts"] == 180
+        assert by_event["g1"]["sp_pitch_count_l2_starts"] == 100
+
+    def test_handedness(self):
+        assert self._by_event()["g0"]["sp_is_lhp"] == 1.0
+
+
+class TestMarketPriorSubset:
+    def _frame(self):
+        return ds.build_training_frame(_synthetic_games(), "moneyline")
+
+    def test_no_prior_column_no_subset(self):
+        report = tr.walk_forward_report(self._frame(), min_train_seasons=4)
+        assert all(
+            "market_prior_subset" not in rep for rep in report["seasons"].values()
+        )
+
+    def test_gate_not_evaluated_below_min_n(self):
+        frame = self._frame()
+        frame["market_prior_p_home"] = np.nan
+        rows_2022 = frame.index[frame["season"] == 2022][:50]
+        frame.loc[rows_2022, "market_prior_p_home"] = 0.5
+        report = tr.walk_forward_report(frame, min_train_seasons=4)
+
+        sub = report["seasons"][2022]["market_prior_subset"]
+        assert sub["n"] == 50
+        assert sub["gate"]["evaluated"] is False
+        assert "publishing stays blocked" in sub["gate"]["note"]
+        # A constant-0.5 prior scores ln(2) on any outcome mix.
+        assert sub["market_prior"]["log_loss"] == pytest.approx(0.69315, abs=1e-4)
+        # Models are ALSO scored on those same 50 rows, never the full season.
+        assert sub["logistic_calibrated"]["n"] == 50
+
+        empty = report["seasons"][2023]["market_prior_subset"]
+        assert empty["n"] == 0
+        assert "gate" not in empty
+
+    def test_gate_evaluated_with_enough_sample(self):
+        frame = self._frame()
+        frame["market_prior_p_home"] = np.nan
+        frame.loc[frame["season"] == 2023, "market_prior_p_home"] = 0.5
+        report = tr.walk_forward_report(frame, min_train_seasons=4)
+
+        sub = report["seasons"][2023]["market_prior_subset"]
+        assert sub["n"] >= tr.MIN_GATE_N
+        assert sub["gate"]["evaluated"] is True
+        # Against a coin-flip prior the learned models must win (same claim
+        # the baseline_constant assertion makes on the full season).
+        assert sub["gate"]["beaten_by"] == {"logistic": True, "hist_gb": True}
+
+        import json
+
+        json.dumps(report)
+
+
+@pytest.mark.integration
+def test_load_market_prior_uses_last_pregame_sharp_pair(seeded):
+    from sqlalchemy import text
+
+    db, tables, _ = seeded
+
+    def _snap(conn, book_key, side, price, captured_at):
+        conn.execute(
+            text(
+                """
+                INSERT INTO odds_snapshots
+                    (event_id, book_id, market, side, price_decimal,
+                     price_american, captured_at)
+                SELECT e.id, b.id, 'moneyline', :side, :price, -110, :captured_at
+                FROM events e, books b
+                WHERE e.external_ids ->> 'mlb_game_pk' = '900001' AND b.key = :book
+                """
+            ),
+            {"side": side, "price": price, "captured_at": captured_at, "book": book_key},
+        )
+
+    ts = lambda h, m=0: datetime(2026, 7, 5, h, m, tzinfo=timezone.utc)  # noqa: E731
+    with db.begin() as conn:
+        # Early sharp pair, superseded by a later one.
+        _snap(conn, "pinnacle", "home", 1.91, ts(18))
+        _snap(conn, "pinnacle", "away", 1.91, ts(18))
+        _snap(conn, "pinnacle", "home", 1.85, ts(21))
+        _snap(conn, "pinnacle", "away", 2.10, ts(21))
+        # Incomplete pair (home only): unusable for devig.
+        _snap(conn, "pinnacle", "home", 1.80, ts(22))
+        # Soft book pair even later: not the reference (is_sharp = false).
+        _snap(conn, "bet365", "home", 1.75, ts(22, 30))
+        _snap(conn, "bet365", "away", 2.20, ts(22, 30))
+
+    prior = ds.load_market_prior(db, "moneyline")
+    assert len(prior) == 1
+    p_home_imp, p_away_imp = 1 / 1.85, 1 / 2.10
+    expected = p_home_imp / (p_home_imp + p_away_imp)
+    assert prior["market_prior_p_home"].iloc[0] == pytest.approx(expected)
+
+    assert ds.load_market_prior(db, "f5_moneyline").empty
+
+
+@pytest.mark.integration
+def test_train_f1_job_reports_sp_coverage(seeded):
+    """End-to-end job path: loads pitching, computes coverage, JSON-safe."""
+    import json
+
+    from app.jobs import train_f1
+
+    db, _, _ = seeded
+    result = train_f1.run(engine=db)
+    json.dumps(result)
+    block = result["markets"]["moneyline"]
+    # 5 finished games; only the July 6th one has BOTH starters with prior
+    # history (SP1's June 5th start has no priors at all).
+    assert block["rows"] == 5
+    assert block["sp_coverage"] == 0.2
+    # Not enough seasons to test anything: the report stays honest and empty.
+    assert block["report"]["seasons"] == {}
+
 
 @pytest.mark.integration
 def test_bulk_features_match_online_builder(seeded):
@@ -114,12 +313,16 @@ def test_bulk_features_match_online_builder(seeded):
     from app.features import builder
     from app.ml.dataset import build_training_frame, load_results_frame
 
+    from app.ml.dataset import load_pitching_frame
+
     db, tables, target_id = seeded
     games = load_results_frame(db)
 
     # The online builder computed the July 5th game's form for team H; the
-    # bulk frame's row for that same game must match field by field.
-    frame = build_training_frame(games, "moneyline")
+    # bulk frame's row for that same game must match field by field. The
+    # seeded probables MATCH the actual starters, so the starter block must
+    # agree too (probable-based online vs actual-starter bulk).
+    frame = build_training_frame(games, "moneyline", pitching=load_pitching_frame(db))
     with db.connect() as conn:
         # as_of == start time (training convention) for the July 6th game,
         # where team H (away side) has exactly one prior game in window.
@@ -135,6 +338,7 @@ def test_bulk_features_match_online_builder(seeded):
         "games_30d", "win_pct_30d", "runs_pg_30d", "runs_allowed_pg_30d",
         "f5_games_30d", "f5_runs_pg_30d", "f5_runs_allowed_pg_30d",
         "rest_days", "games_last_7d",
+        *ds.SP_FEATURE_NAMES,
     ):
         for side in ("home", "away"):
             online_val = online[side][name]

@@ -7,9 +7,12 @@
 # Notas operativas:
 # - Los schedules SOLO corren en la rama default (main): hay que mergear
 #   la rama de desarrollo para que arranquen.
-# - GitHub puede retrasar los schedules varios minutos; con cadencia de
-#   horas no importa, y el closing run usa una ventana de 30 min que
-#   absorbe el retraso.
+# - Los minutos de los cron son deliberadamente "raros" (17, 23, 7, 37):
+#   GitHub degrada los schedules del minuto :00 en horas pico — el
+#   2026-07-09 el cron de 14:00 llevaba +100 min sin disparar y los del
+#   día anterior salieron con 1-4 h de retraso. Minutos fuera de la hora
+#   en punto reducen (no eliminan) ese retraso; el job audit_snapshots
+#   detecta los huecos que igual se cuelen.
 # - GitHub desactiva los schedules tras ~60 dias sin actividad en el
 #   repo; un commit cualquiera los reactiva.
 # - Todos los jobs son idempotentes: una corrida duplicada no ensucia datos.
@@ -18,13 +21,13 @@ name: Ingesta EDGE
 
 on:
   schedule:
-    # sync_schedule: slate del dia (14:00 UTC ~ manana en America)
-    - cron: '0 14 * * *'
+    # Slate del dia + resultados/pitcheo de ayer (14:17 UTC ~ manana en America)
+    - cron: '17 14 * * *'
     # snapshot_odds: archivo de lineas en horario de juegos MLB
-    - cron: '0 15,18,21,0 * * *'
-    # Closing runs cada 30 min en la ventana de inicios (17:00-03:00 UTC
+    - cron: '23 15,18,21,0 * * *'
+    # Closing runs cada 30 min en la ventana de inicios (16:00-04:00 UTC
     # aprox). ALTO consumo de creditos: descomentar al pasar al plan 20K.
-    # - cron: '*/30 16-23,0-3 * * *'
+    # - cron: '7,37 16-23,0-3 * * *'
   workflow_dispatch:
     inputs:
       job:
@@ -36,6 +39,8 @@ on:
           - snapshot_odds
           - snapshot_odds_closing
           - backfill_results
+          - backfill_pitching
+          - audit_snapshots
           - train_f1
           - apply_migration
       args:
@@ -43,11 +48,15 @@ on:
         type: string
         default: ''
 
-# Grupos separados: los crons programados nunca desplazan de la cola a un
-# backfill/entrenamiento manual (los jobs son idempotentes y tocan tablas
-# distintas, correr en paralelo es seguro).
+# Grupos separados por tipo de evento Y por schedule: los crons programados
+# nunca desplazan de la cola a un backfill/entrenamiento manual, y el cron
+# diario de mantenimiento nunca compite con los de snapshots (GitHub cancela
+# la corrida PENDIENTE de un grupo cuando llega una tercera; con grupos
+# separados eso solo puede pasar entre corridas del mismo cron, donde la
+# nueva es un reemplazo válido). Los jobs son idempotentes y tocan tablas
+# distintas: correr en paralelo es seguro.
 concurrency:
-  group: ingesta-${{ github.event_name }}
+  group: ingesta-${{ github.event_name }}-${{ github.event.schedule }}
   cancel-in-progress: false
 
 permissions:
@@ -92,14 +101,31 @@ jobs:
               snapshot_odds)         python -m app.jobs.snapshot_odds $INPUT_ARGS ;;
               snapshot_odds_closing) python -m app.jobs.snapshot_odds --closing-window-min 30 $INPUT_ARGS ;;
               backfill_results)      python -m app.jobs.backfill_results $INPUT_ARGS ;;
+              backfill_pitching)     python -m app.jobs.backfill_pitching $INPUT_ARGS ;;
+              audit_snapshots)       python -m app.jobs.audit_snapshots $INPUT_ARGS ;;
               train_f1)              pip install --quiet "./apps/api[ml]" && python -m app.jobs.train_f1 $INPUT_ARGS ;;
               apply_migration)       python -m app.jobs.apply_migration $INPUT_ARGS ;;
               *) echo "job desconocido: $INPUT_JOB" >&2; exit 1 ;;
             esac
-          elif [ "$SCHEDULE" = "0 14 * * *" ]; then
+          elif [ "$SCHEDULE" = "17 14 * * *" ]; then
+            # Mantenimiento diario del corpus: slate de hoy (con probables),
+            # resultados y game logs de los últimos 3 días (lookback: una
+            # corrida saltada por GitHub se auto-repara al día siguiente;
+            # skip-existing hace el re-proceso casi gratis), y auditoría de
+            # huecos del archivo de odds de ayer — en rojo si hubo huecos.
+            YDAY=$(date -u -d "yesterday" +%F)
+            START=$(date -u -d "3 days ago" +%F)
             python -m app.jobs.sync_schedule
-          elif [ "$SCHEDULE" = "*/30 16-23,0-3 * * *" ]; then
+            python -m app.jobs.backfill_results --start-date "$START" --end-date "$YDAY"
+            python -m app.jobs.backfill_pitching --start-date "$START" --end-date "$YDAY"
+            python -m app.jobs.audit_snapshots --start-date "$YDAY" --end-date "$YDAY" --fail-on-gaps
+          elif [ "$SCHEDULE" = "7,37 16-23,0-3 * * *" ]; then
             python -m app.jobs.snapshot_odds --closing-window-min 30
           else
+            # Antes de cada snapshot, refrescar slate y probables (1 llamada
+            # MLB gratis): auto-repara el slate si el cron diario se saltó y
+            # archiva los cambios de probable intradía (scratches) — justo
+            # los eventos donde la línea más se mueve.
+            python -m app.jobs.sync_schedule
             python -m app.jobs.snapshot_odds
           fi

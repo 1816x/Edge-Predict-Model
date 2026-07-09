@@ -161,6 +161,68 @@ CREATE TABLE event_results (
 );
 
 -- ============================================================================
+-- Players, pitching game logs and probables (F1 starter block)
+-- ============================================================================
+
+-- Generic player dimension (not just pitchers: the lineup block reuses it).
+-- pitch_hand is NULLable — old boxscores occasionally omit it, and a known
+-- hand must never be clobbered with NULL (the store layer COALESCEs).
+CREATE TABLE players (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    sport_id      uuid NOT NULL REFERENCES sports (id),
+    mlb_person_id integer NOT NULL UNIQUE,
+    full_name     text NOT NULL,
+    pitch_hand    text CHECK (pitch_hand IN ('L', 'R', 'S')),
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- One row per pitcher per game (ALL pitchers, is_starter flags the opener of
+-- record — unlocks the bullpen block without re-ingesting). outs_recorded is
+-- IP as an exact integer (5.2 innings -> 17 outs), never a float. Counting
+-- columns that old boxscores may omit (fly_outs, sac_flies, pitches) are
+-- NULLable: a hole in the feed must not block the row. NOT append-only:
+-- MLB corrects boxscores, upserts are DO UPDATE like event_results.
+CREATE TABLE pitching_game_logs (
+    event_id       uuid NOT NULL REFERENCES events (id),
+    player_id      uuid NOT NULL REFERENCES players (id),
+    team_id        uuid NOT NULL REFERENCES teams (id),
+    is_home        boolean NOT NULL,
+    is_starter     boolean NOT NULL,
+    outs_recorded  integer NOT NULL CHECK (outs_recorded >= 0),
+    batters_faced  integer NOT NULL CHECK (batters_faced >= 0),
+    strikeouts     integer NOT NULL CHECK (strikeouts >= 0),
+    walks          integer NOT NULL CHECK (walks >= 0),
+    hit_batsmen    integer NOT NULL CHECK (hit_batsmen >= 0),
+    home_runs      integer NOT NULL CHECK (home_runs >= 0),
+    fly_outs       integer CHECK (fly_outs >= 0),
+    ground_outs    integer CHECK (ground_outs >= 0),
+    sac_flies      integer CHECK (sac_flies >= 0),
+    pitches_thrown integer CHECK (pitches_thrown >= 0),
+    source         text,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    updated_at     timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (event_id, player_id)
+);
+
+-- Probable starters as an append-per-change history: a row is inserted
+-- whenever the announced probable DIFFERS from the currently-recorded one
+-- (dedupe lives in the store layer, NOT in a unique constraint: a
+-- re-announcement X -> Y -> X must record X's return or the as-of
+-- resolution would answer Y forever). The probable "as-of T" is the row
+-- with the greatest first_seen_at <= T — a late scratch stays audited as
+-- history instead of being overwritten (same archive-from-day-one
+-- philosophy as odds_snapshots).
+CREATE TABLE event_probables (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id      uuid NOT NULL REFERENCES events (id),
+    side          text NOT NULL CHECK (side IN ('home', 'away')),
+    player_id     uuid NOT NULL REFERENCES players (id),
+    first_seen_at timestamptz NOT NULL DEFAULT now(),
+    created_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- ============================================================================
 -- Odds snapshots (append-only)
 -- ============================================================================
 
@@ -361,6 +423,11 @@ CREATE INDEX idx_predictions_model_version ON predictions (model_version_id, cre
 CREATE INDEX idx_feature_snapshots_event_market_asof
     ON feature_snapshots (event_id, market, as_of_ts DESC);
 
+-- Starter history per pitcher (as-of feature windows) and probable lookup.
+CREATE INDEX idx_pitching_logs_player ON pitching_game_logs (player_id);
+CREATE INDEX idx_event_probables_event
+    ON event_probables (event_id, side, first_seen_at DESC);
+
 -- Aggregated performance (monthly yield, CLV beat-rate).
 CREATE INDEX idx_pick_results_settled_at ON pick_results (settled_at);
 CREATE INDEX idx_daily_scans_date ON daily_scans (scan_date DESC);
@@ -403,6 +470,14 @@ CREATE TRIGGER trg_events_updated_at
 
 CREATE TRIGGER trg_event_results_updated_at
     BEFORE UPDATE ON event_results
+    FOR EACH ROW EXECUTE FUNCTION edge_set_updated_at();
+
+CREATE TRIGGER trg_players_updated_at
+    BEFORE UPDATE ON players
+    FOR EACH ROW EXECUTE FUNCTION edge_set_updated_at();
+
+CREATE TRIGGER trg_pitching_game_logs_updated_at
+    BEFORE UPDATE ON pitching_game_logs
     FOR EACH ROW EXECUTE FUNCTION edge_set_updated_at();
 
 -- ============================================================================

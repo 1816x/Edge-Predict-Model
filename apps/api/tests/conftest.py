@@ -50,16 +50,23 @@ def db(db_engine):
 
 @pytest.fixture
 def seeded(db):
-    """Target game H vs A on 2026-07-08T23:00Z plus curated history.
+    """Target game H vs A on 2026-07-08T23:00Z plus curated history,
+    including starter game logs and probables for the July 6th game.
 
     Shared by the feature-builder tests and the bulk-vs-online parity test.
+    Probables MATCH the actual starters on purpose: parity between the
+    online builder (probable-based) and the training frame (actual-starter
+    based) only holds when they agree.
     """
     from datetime import datetime, timezone
 
+    from sqlalchemy import text
+
     from app.ingestion import store
-    from app.ingestion.parsers import GameResult, ScheduledGame
+    from app.ingestion.parsers import GameResult, PitchingLine, ScheduledGame
 
     H, A, X = "Boston Red Sox", "New York Yankees", "Tampa Bay Rays"
+    SP1, SP2 = 500001, 500002  # X's righty ace, H's lefty
 
     def _game(pk, start, home, away, status="final"):
         return ScheduledGame(
@@ -76,27 +83,86 @@ def seeded(db):
             store.upsert_event_result(conn, tables, event_id, result)
         return event_id
 
+    def _line(pid, is_home, is_starter, outs, bf, k, bb, hbp, hr, fly, sac, pitches):
+        return PitchingLine(
+            mlb_person_id=pid, full_name=f"P{pid}", pitch_hand=None,
+            is_home=is_home, is_starter=is_starter, outs_recorded=outs,
+            batters_faced=bf, strikeouts=k, walks=bb, hit_batsmen=hbp,
+            home_runs=hr, fly_outs=fly, ground_outs=None, sac_flies=sac,
+            pitches_thrown=pitches,
+        )
+
     tables = store.reflect_tables(
-        db, ("sports", "teams", "events", "event_results", "feature_snapshots")
+        db,
+        (
+            "sports", "teams", "events", "event_results", "feature_snapshots",
+            "players", "pitching_game_logs", "event_probables",
+        ),
     )
     ts = lambda m, d, h: datetime(2026, m, d, h, 0, tzinfo=timezone.utc)  # noqa: E731
     with db.begin() as conn:
+        conn.execute(text("TRUNCATE players CASCADE"))
         sport_id = store.get_sport_id(conn, tables)
         target_id = _seed(
             conn, tables, sport_id, 900010, ts(7, 8, 23), H, A, status="scheduled"
         )
         # H history: a win and a loss inside the 30d window...
-        _seed(conn, tables, sport_id, 900001, ts(7, 5, 23), H, X,
-              GameResult(900001, 5, 3, 3, 1))
-        _seed(conn, tables, sport_id, 900002, ts(7, 6, 23), X, H,
-              GameResult(900002, 7, 2, 4, 0))
+        e900001 = _seed(conn, tables, sport_id, 900001, ts(7, 5, 23), H, X,
+                        GameResult(900001, 5, 3, 3, 1))
+        e900002 = _seed(conn, tables, sport_id, 900002, ts(7, 6, 23), X, H,
+                        GameResult(900002, 7, 2, 4, 0))
         # ...one game outside the 30d window (June 5th)...
-        _seed(conn, tables, sport_id, 900003, ts(6, 5, 23), H, X,
-              GameResult(900003, 1, 0, 0, 0))
+        e900003 = _seed(conn, tables, sport_id, 900003, ts(6, 5, 23), H, X,
+                        GameResult(900003, 1, 0, 0, 0))
         # ...and one AFTER as_of (starts 07-09T00:00Z): must never leak in.
         _seed(conn, tables, sport_id, 900004, ts(7, 9, 0), H, X,
               GameResult(900004, 10, 0, 8, 0))
         # A history: single loss on July 4th.
-        _seed(conn, tables, sport_id, 900005, ts(7, 4, 23), A, X,
-              GameResult(900005, 2, 6, 1, 2))
+        e900005 = _seed(conn, tables, sport_id, 900005, ts(7, 4, 23), A, X,
+                        GameResult(900005, 2, 6, 1, 2))
+
+        # --- Starter block seeds (docs/04 §1.3) ------------------------------
+        player_cache: dict[int, object] = {}
+        store.bulk_upsert_players(
+            conn, tables, sport_id,
+            [
+                {"mlb_person_id": SP1, "full_name": "Righty Ace", "pitch_hand": "R"},
+                {"mlb_person_id": SP2, "full_name": "Lefty Homegrown", "pitch_hand": "L"},
+            ],
+            player_cache,
+        )
+        teams = store.load_team_cache(conn, tables, sport_id)
+        # SP1 (pitches for X): starts on June 5th and July 4th.
+        store.bulk_upsert_pitching_logs(
+            conn, tables, e900003, teams[H], teams[X],
+            [_line(SP1, False, True, 18, 24, 6, 2, 0, 1, 5, 1, 92)], player_cache,
+        )
+        store.bulk_upsert_pitching_logs(
+            conn, tables, e900005, teams[A], teams[X],
+            [_line(SP1, False, True, 12, 18, 3, 4, 0, 2, 6, 0, 88)], player_cache,
+        )
+        # SP2 (pitches for H): one start on July 5th, pitch count unrecorded.
+        store.bulk_upsert_pitching_logs(
+            conn, tables, e900001, teams[H], teams[X],
+            [_line(SP2, True, True, 15, 20, 7, 3, 1, 0, 4, 0, None)], player_cache,
+        )
+        # The July 6th game itself: SP1 started for X (home), SP2 for H (away).
+        store.bulk_upsert_pitching_logs(
+            conn, tables, e900002, teams[X], teams[H],
+            [
+                _line(SP1, True, True, 16, 22, 5, 1, 0, 1, 4, 0, 90),
+                _line(SP2, False, True, 14, 19, 6, 2, 0, 1, 3, 1, 85),
+            ],
+            player_cache,
+        )
+        # Probables announced the morning of July 6th, matching the starters.
+        store.record_probables(
+            conn, tables,
+            [
+                {"event_id": e900002, "side": "home",
+                 "player_id": player_cache[SP1], "first_seen_at": ts(7, 6, 12)},
+                {"event_id": e900002, "side": "away",
+                 "player_id": player_cache[SP2], "first_seen_at": ts(7, 6, 12)},
+            ],
+        )
     return db, tables, target_id

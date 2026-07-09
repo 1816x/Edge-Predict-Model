@@ -41,6 +41,58 @@ def test_team_form_rolling_windows(seeded):
     assert away["games_last_7d"] == 1
 
 
+def test_starter_block_hand_computed_values(seeded):
+    """docs/04 §1.3 block for the July 6th game, from the as-of probables.
+
+    League before 2026-07-06T23:00Z = three starter rows (SP1 on Jun 5 and
+    Jul 4, SP2 on Jul 5): sumK 16, sumBB 9, sumBF 62, sumHR 3, sumFB 19,
+    sum(BB+HBP) 10, outs 45 (15 IP) -> lg_kbb 7/62, lg_hrfb 3/19,
+    lg_xfip_core 37/15.
+    """
+    from sqlalchemy import text
+
+    db, tables, _ = seeded
+    with db.connect() as conn:
+        event_id = conn.execute(
+            text("SELECT id FROM events WHERE external_ids ->> 'mlb_game_pk' = '900002'")
+        ).scalar_one()
+        features = builder.build_features(
+            conn, tables, event_id, "moneyline",
+            datetime(2026, 7, 6, 23, 0, tzinfo=timezone.utc),
+        )
+
+    home = features["home"]  # SP1: starts Jun 5 (K6 BB2 BF24) + Jul 4 (K3 BB4 BF18)
+    lg_kbb, lg_hrfb, lg_core = 7 / 62, 3 / 19, 37 / 15
+    assert home["sp_kbb_pct_l5_starts"] == round((3 + 60 * lg_kbb) / 102, 4)
+    assert home["sp_kbb_pct_season"] == home["sp_kbb_pct_l5_starts"]  # both starts are 2026
+    assert home["sp_xfip_l5_starts"] == round(
+        (13 * 15 * lg_hrfb + 3 * 6 - 2 * 9 + 15 * lg_core) / 25, 4
+    )
+    assert home["sp_days_rest"] == 2  # Jul 6 minus Jul 4
+    assert home["sp_pitch_count_l2_starts"] == 180  # 92 + 88
+    assert home["sp_is_lhp"] == 0
+
+    away = features["away"]  # SP2: one start Jul 5 (K7 BB3 BF20), pitches NULL
+    assert away["sp_kbb_pct_l5_starts"] == round((4 + 60 * lg_kbb) / 80, 4)
+    assert away["sp_xfip_l5_starts"] == round(
+        (13 * 4 * lg_hrfb + 3 * 4 - 2 * 7 + 15 * lg_core) / 20, 4
+    )
+    assert away["sp_days_rest"] == 1
+    assert away["sp_pitch_count_l2_starts"] is None  # unrecorded, never zero
+    assert away["sp_is_lhp"] == 1
+
+    assert features["feature_version"] == "team_form_sp_v2"
+
+
+def test_starter_block_none_without_probable(seeded):
+    """The target game has no probables recorded: the whole block is None."""
+    db, tables, target_id = seeded
+    with db.connect() as conn:
+        features = builder.build_features(conn, tables, target_id, "moneyline", AS_OF)
+    for side in ("home", "away"):
+        assert all(features[side][name] is None for name in builder.SP_FEATURES)
+
+
 def test_future_game_never_leaks(seeded):
     db, tables, target_id = seeded
     with db.connect() as conn:
