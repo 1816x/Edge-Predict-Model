@@ -48,13 +48,14 @@ Ciclo: Claude push a su rama → PR a `main` → merge → los crons toman el c�
 
 ## 3. Siguiente jugada (esta semana)
 
-1. **(Ambos)** Vigilar 1–2 días la cadencia nueva: cron diario de 14:17 UTC con sus 4 pasos (sync + resultados 3d + pitcheo 3d + audit de ayer con `--fail-on-gaps`) y snapshots a las XX:23 precedidos de sync. Si el audit pinta rojo, diagnóstico antes que nada.
-2. **(Automático)** El train_f1 de ~2026-07-24 trae la primera evaluación real del gate (market prior n≥200 en 2026) y coincide con el cierre del reloj F0. No hay nada que hacer más que dejar que el archivo crezca.
-3. **(Claude — siguiente tanda, cuando digas)** Con abridor y bullpen rindiendo, las opciones en orden de valor esperado:
-   - **Ofensiva real de equipo** (docs/04 §1.2): wOBA/ISO/K%/BB% exigen ingerir líneas de bateo (extensión natural de `backfill_pitching` a boxscore completo) — el bloque grande que falta del vector.
-   - **Higiene de entrenamiento**: escalar features (la logística da ConvergenceWarning en cada corrida — puntos gratis potenciales), y evaluar interacción mano del abridor × splits cuando exista bateo.
-   - `closer_available_flag` (§1.4 restante): exige ingerir transacciones/IL — tanda propia.
-4. **(Tú — opcional)** Si el gate de ~07-24 se ve prometedor, considerar el plan 20K de The Odds API para activar los closing runs (CLV real, hoy comentados en el workflow).
+1. **(Claude — SIGUIENTE TANDA, ya autorizada)** En este orden dentro de la misma tanda:
+   1. **Crons redundantes** (~3 líneas en `ingesta.yml`): duplicar los slots de snapshot a `:23` **y** `:53` de sus horas. Contexto: el 2026-07-10 GitHub disparó el cron diario con 2h18m de retraso y hubo que recuperar el día a mano (runs #39–#43); con slots redundantes un retraso de 1–2 h ya no puede dejar huecos > 4 h y la vigilancia manual deja de existir. Costo: ~4 requests/día extra a The Odds API (caben de sobra en el free tier con F5 apagado). El cron diario de 14:17 se queda igual (su lookback de 3 días ya lo auto-repara).
+   2. **Ofensiva real de equipo** (docs/04 §1.2): wOBA/ISO/K%/BB% — exige ingerir líneas de bateo (extensión natural de `backfill_pitching` a boxscore completo: nueva tabla `batting_game_logs` o similar vía migración 004, backfill por temporada como el de pitcheo, features online/bulk con paridad). El bloque grande que falta del vector.
+   3. **Higiene de entrenamiento**: escalar features (la logística da ConvergenceWarning en cada corrida — puntos gratis potenciales).
+2. **(Ambos)** Vigilar el email del audit diario (~8:17 AM CST). Rojo del 07-10 en adelante = diagnóstico antes que nada. (El rojo del 07-09 fue esperado: día pre-reinicio.)
+3. **(Automático)** El train_f1 de ~2026-07-24 trae la primera evaluación real del gate (market prior n≥200 en 2026) y coincide con el cierre del reloj F0. No hay nada que hacer más que dejar que el archivo crezca.
+4. **(Después, tandas propias)** Interacción mano del abridor × splits (necesita bateo); `closer_available_flag` (§1.4 restante, exige transacciones/IL).
+5. **(Tú — opcional)** Si el gate de ~07-24 se ve prometedor, considerar el plan 20K de The Odds API para activar los closing runs (CLV real, hoy comentados en el workflow).
 
 ## 4. Fases y gates (resumen — detalle en `docs/07-roadmap.md`)
 
