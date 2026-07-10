@@ -81,7 +81,65 @@ def test_starter_block_hand_computed_values(seeded):
     assert away["sp_pitch_count_l2_starts"] is None  # unrecorded, never zero
     assert away["sp_is_lhp"] == 1
 
-    assert features["feature_version"] == "team_form_sp_v2"
+    # --- Bullpen block (§1.4). Reliever league in [D-365, Jul 5]: R1 twice
+    # (Jul 4/5) + R2 (Jul 5) + R3 (Jun 5): K8 BB6 HBP1 HR2 FB11, 21 outs.
+    # The June 5th line sits OUTSIDE the 30d team window (Jun 6..Jul 5) and
+    # R3's same-day relief line on Jul 6 must not count anywhere.
+    lg_hrfb_bp, lg_core_bp = 2 / 11, (13 * 2 + 3 * 7 - 2 * 8) / 7
+    assert home["bullpen_ip_l3d"] == 5.0  # X: 9 + 6 outs on Jul 4-5
+    assert home["bullpen_b2b_flag"] == 1  # 6 outs yesterday
+    assert home["bullpen_xfip_30d"] == round(
+        (13 * 7 * lg_hrfb_bp + 3 * 4 - 2 * 5 + 15 * lg_core_bp) / 20, 4
+    )
+    assert home["bullpen_ip_expected"] == 5.0  # SP1: (18+12)/2 outs per start
+    assert away["bullpen_ip_l3d"] == 1.0  # H: R2's 3 outs on Jul 5
+    assert away["bullpen_b2b_flag"] == 1  # exactly at the 3-out threshold
+    assert away["bullpen_xfip_30d"] == round(
+        (13 * 3 * lg_hrfb_bp + 3 * 3 - 2 * 1 + 15 * lg_core_bp) / 16, 4
+    )
+    assert away["bullpen_ip_expected"] == 5.0  # SP2: 15 outs in his one start
+
+    assert features["feature_version"] == "team_form_sp_bp_v3"
+
+
+def test_bullpen_block_is_none_before_the_archive_is_alive(seeded):
+    """June 5th: no reliever line exists in the trailing year (R3's own
+    same-day line doesn't count) — the block must be None, NOT a fabricated
+    'fully rested' zero. Zeros are only true while the archive is alive."""
+    from sqlalchemy import text
+
+    db, tables, _ = seeded
+    with db.connect() as conn:
+        event_id = conn.execute(
+            text("SELECT id FROM events WHERE external_ids ->> 'mlb_game_pk' = '900003'")
+        ).scalar_one()
+        features = builder.build_features(
+            conn, tables, event_id, "moneyline",
+            datetime(2026, 6, 5, 23, 0, tzinfo=timezone.utc),
+        )
+    for side in ("home", "away"):
+        assert features[side]["bullpen_ip_l3d"] is None
+        assert features[side]["bullpen_b2b_flag"] is None
+        assert features[side]["bullpen_xfip_30d"] is None
+
+
+def test_f5_vector_excludes_bullpen_by_design(seeded):
+    """docs/04 §1.4: bullpen features are REMOVED from F5, not zero-weighted."""
+    from sqlalchemy import text
+
+    db, tables, _ = seeded
+    with db.connect() as conn:
+        event_id = conn.execute(
+            text("SELECT id FROM events WHERE external_ids ->> 'mlb_game_pk' = '900002'")
+        ).scalar_one()
+        features = builder.build_features(
+            conn, tables, event_id, "f5_moneyline",
+            datetime(2026, 7, 6, 23, 0, tzinfo=timezone.utc),
+        )
+    for side in ("home", "away"):
+        assert not any(k.startswith("bullpen_") for k in features[side])
+        # The starter block itself is intact.
+        assert features[side]["sp_kbb_pct_l5_starts"] is not None
 
 
 def test_starter_block_none_without_probable(seeded):

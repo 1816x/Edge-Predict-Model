@@ -55,22 +55,51 @@ SP_FEATURE_NAMES = (
     "sp_is_lhp",
 )
 
+# Bullpen block (docs/04 §1.4) — MONEYLINE ONLY, day-based windows ending
+# YESTERDAY (intraday-safe rule of §1.1: same-day games excluded wholesale).
+# Knobs MUST mirror app/features/builder.py exactly (parity guard).
+BULLPEN_FATIGUE_DAYS = 3
+BULLPEN_QUALITY_DAYS = 30
+BULLPEN_LEAGUE_DAYS = 365
+BULLPEN_B2B_MIN_OUTS = 3
+
+BP_FEATURE_NAMES = (
+    "bullpen_ip_l3d",
+    "bullpen_b2b_flag",
+    "bullpen_xfip_30d",
+    "bullpen_ip_expected",
+)
+
+_TEAM_FORM_NAMES = (
+    "games_30d",
+    "win_pct_30d",
+    "runs_pg_30d",
+    "runs_allowed_pg_30d",
+    "f5_games_30d",
+    "f5_runs_pg_30d",
+    "f5_runs_allowed_pg_30d",
+    "rest_days",
+    "games_last_7d",
+)
+
+# Moneyline vector: everything. F5 excludes the bullpen block BY DESIGN —
+# leverage relievers do not participate in innings 1-5, so the features
+# are removed rather than zero-weighted (docs/04 §1.4).
 FEATURE_COLUMNS = [
     f"{side}_{name}"
     for side in ("home", "away")
-    for name in (
-        "games_30d",
-        "win_pct_30d",
-        "runs_pg_30d",
-        "runs_allowed_pg_30d",
-        "f5_games_30d",
-        "f5_runs_pg_30d",
-        "f5_runs_allowed_pg_30d",
-        "rest_days",
-        "games_last_7d",
-        *SP_FEATURE_NAMES,
-    )
+    for name in (*_TEAM_FORM_NAMES, *SP_FEATURE_NAMES, *BP_FEATURE_NAMES)
 ]
+F5_FEATURE_COLUMNS = [
+    f"{side}_{name}"
+    for side in ("home", "away")
+    for name in (*_TEAM_FORM_NAMES, *SP_FEATURE_NAMES)
+]
+
+
+def feature_columns(market: str) -> list[str]:
+    """The feature vector for one market (bullpen enters moneyline only)."""
+    return FEATURE_COLUMNS if market == "moneyline" else F5_FEATURE_COLUMNS
 
 _RESULTS_SQL = """
 SELECT e.id AS event_id,
@@ -125,6 +154,32 @@ def load_pitching_frame(engine: Engine, sport: str = "mlb") -> pd.DataFrame:
     """One row per STARTER per game (feature windows count starts only)."""
     with engine.connect() as conn:
         df = pd.read_sql(text(_PITCHING_SQL), conn, params={"sport": sport})
+    df["start_time_utc"] = pd.to_datetime(df["start_time_utc"], utc=True)
+    return df
+
+
+_BULLPEN_SQL = """
+SELECT l.team_id,
+       e.start_time_utc,
+       l.outs_recorded,
+       l.strikeouts,
+       l.walks,
+       l.hit_batsmen,
+       l.home_runs,
+       l.fly_outs,
+       l.sac_flies
+FROM pitching_game_logs l
+JOIN events e ON e.id = l.event_id
+JOIN sports s ON s.id = e.sport_id
+WHERE s.key = :sport AND NOT l.is_starter
+ORDER BY e.start_time_utc
+"""
+
+
+def load_bullpen_frame(engine: Engine, sport: str = "mlb") -> pd.DataFrame:
+    """One row per RELIEVER line per game (bullpen block, docs/04 §1.4)."""
+    with engine.connect() as conn:
+        df = pd.read_sql(text(_BULLPEN_SQL), conn, params={"sport": sport})
     df["start_time_utc"] = pd.to_datetime(df["start_time_utc"], utc=True)
     return df
 
@@ -322,7 +377,12 @@ def _starter_features(pitching: pd.DataFrame) -> pd.DataFrame:
             (13.0 * s_hr + 3.0 * (s_bb + s_hbp) - 2.0 * s_k) / (s_outs / 3.0),
         )
 
-    out = {name: np.full(len(pt), np.nan) for name in SP_FEATURE_NAMES}
+    # bullpen_ip_expected (§1.4) rides here: mean IP per start of the game's
+    # starter, derived from the exact rows this loop already walks.
+    out = {
+        name: np.full(len(pt), np.nan)
+        for name in (*SP_FEATURE_NAMES, "bullpen_ip_expected")
+    }
     hand = pt["pitch_hand"].to_numpy(dtype=object)
     out["sp_is_lhp"] = np.where(
         hand == "L", 1.0, np.where(hand == "R", 0.0, np.nan)
@@ -345,6 +405,11 @@ def _starter_features(pitching: pd.DataFrame) -> pd.DataFrame:
             w2 = idx[max(lo365, hi - SP_PITCH_COUNT_STARTS):hi]
             if len(w2) and not np.isnan(pitches[w2]).all():
                 out["sp_pitch_count_l2_starts"][i] = np.nansum(pitches[w2])
+            if hi > lo365:
+                w365 = idx[lo365:hi]
+                out["bullpen_ip_expected"][i] = round(
+                    float(outs[w365].mean()) / 3.0, 4
+                )
             league = _league_at(cutoff)
             if league is None or hi == lo365:
                 continue
@@ -373,13 +438,136 @@ def _starter_features(pitching: pd.DataFrame) -> pd.DataFrame:
     return features
 
 
+def _utc_epoch_days(series: pd.Series) -> np.ndarray:
+    """tz-aware timestamps -> integer UTC calendar days (for day windows)."""
+    return (
+        series.dt.tz_convert("UTC").dt.tz_localize(None)
+        .to_numpy(dtype="datetime64[ns]")
+        .astype("datetime64[D]")
+        .astype(int)
+    )
+
+
+def _bullpen_features(bullpen: pd.DataFrame, games: pd.DataFrame) -> pd.DataFrame:
+    """Per-game bullpen fatigue/quality (bulk twin of builder._bullpen_block).
+
+    Windows are UTC calendar days ending YESTERDAY relative to each game's
+    day (intraday-safe rule). ip_l3d/b2b are TRUE ZEROS when the team's
+    relievers did not pitch in the window — but only while the reliever
+    archive is alive at that date (a valid as-of league): games before the
+    first archived reliever line stay NaN, or a partial archive would
+    fabricate "fully rested" bullpens season-wide. The quality rate stays
+    NaN without sample. Mirrors builder._bullpen_block exactly.
+    """
+    bp = bullpen.sort_values("start_time_utc").reset_index(drop=True)
+    days = _utc_epoch_days(bp["start_time_utc"])
+    outs = bp["outs_recorded"].to_numpy(dtype=float)
+    k = bp["strikeouts"].to_numpy(dtype=float)
+    bb = bp["walks"].to_numpy(dtype=float)
+    hbp = bp["hit_batsmen"].to_numpy(dtype=float)
+    fb = (
+        bp["fly_outs"].fillna(0).to_numpy(dtype=float)
+        + bp["sac_flies"].fillna(0).to_numpy(dtype=float)
+        + bp["home_runs"].to_numpy(dtype=float)
+    )
+
+    def _cum(a: np.ndarray) -> np.ndarray:
+        return np.concatenate([[0.0], np.cumsum(a)])
+
+    lg = {"k": _cum(k), "bb": _cum(bb), "hbp": _cum(hbp), "fb": _cum(fb),
+          "outs": _cum(outs), "hr": _cum(bp["home_runs"].to_numpy(dtype=float))}
+
+    def _league_at(day: int) -> tuple[float, float] | None:
+        lo = int(np.searchsorted(days, day - BULLPEN_LEAGUE_DAYS, side="left"))
+        hi = int(np.searchsorted(days, day, side="left"))
+        s_outs, s_fb = lg["outs"][hi] - lg["outs"][lo], lg["fb"][hi] - lg["fb"][lo]
+        if s_outs == 0 or s_fb == 0:
+            return None
+        s_hr = lg["hr"][hi] - lg["hr"][lo]
+        s_bb_hbp = (lg["bb"][hi] - lg["bb"][lo]) + (lg["hbp"][hi] - lg["hbp"][lo])
+        s_k = lg["k"][hi] - lg["k"][lo]
+        return (
+            s_hr / s_fb,
+            (13.0 * s_hr + 3.0 * s_bb_hbp - 2.0 * s_k) / (s_outs / 3.0),
+        )
+
+    teams: dict = {}
+    for team_id, group in bp.groupby("team_id", sort=False):
+        pos = group.index.to_numpy()
+        teams[team_id] = {
+            "days": days[pos],
+            "outs": _cum(outs[pos]),
+            "k": _cum(k[pos]),
+            "bb_hbp": _cum(bb[pos] + hbp[pos]),
+            "fb": _cum(fb[pos]),
+        }
+
+    game_days = _utc_epoch_days(games["start_time_utc"])
+    out = {
+        f"{side}_{name}": np.full(len(games), np.nan)
+        for side in ("home", "away")
+        for name in ("bullpen_ip_l3d", "bullpen_b2b_flag", "bullpen_xfip_30d")
+    }
+    team_cols = {
+        "home": games["home_team_id"].to_numpy(dtype=object),
+        "away": games["away_team_id"].to_numpy(dtype=object),
+    }
+    for i in range(len(games)):
+        day = int(game_days[i])
+        league = _league_at(day)
+        if league is None:
+            continue  # archive not alive yet at this date: NaN, not zeros
+        for side in ("home", "away"):
+            t = teams.get(team_cols[side][i])
+            if t is None:
+                out[f"{side}_bullpen_ip_l3d"][i] = 0.0
+                out[f"{side}_bullpen_b2b_flag"][i] = 0.0
+                continue
+            hi = int(np.searchsorted(t["days"], day, side="left"))
+            lo3 = int(np.searchsorted(t["days"], day - BULLPEN_FATIGUE_DAYS, side="left"))
+            loy = int(np.searchsorted(t["days"], day - 1, side="left"))
+            lo30 = int(np.searchsorted(t["days"], day - BULLPEN_QUALITY_DAYS, side="left"))
+            out[f"{side}_bullpen_ip_l3d"][i] = round(
+                (t["outs"][hi] - t["outs"][lo3]) / 3.0, 4
+            )
+            out[f"{side}_bullpen_b2b_flag"][i] = float(
+                (t["outs"][hi] - t["outs"][loy]) >= BULLPEN_B2B_MIN_OUTS
+            )
+            if hi > lo30 and league is not None:
+                lg_hrfb, lg_core = league
+                s_k = t["k"][hi] - t["k"][lo30]
+                s_bb_hbp = t["bb_hbp"][hi] - t["bb_hbp"][lo30]
+                s_fb = t["fb"][hi] - t["fb"][lo30]
+                s_ip = (t["outs"][hi] - t["outs"][lo30]) / 3.0
+                core = 13.0 * s_fb * lg_hrfb + 3.0 * s_bb_hbp - 2.0 * s_k
+                out[f"{side}_bullpen_xfip_30d"][i] = round(
+                    (core + SP_SHRINK_IP * lg_core) / (s_ip + SP_SHRINK_IP), 4
+                )
+
+    features = pd.DataFrame(out)
+    features["event_id"] = games["event_id"].to_numpy()
+    return features
+
+
+def _merge_bullpen_features(
+    frame: pd.DataFrame, bullpen: pd.DataFrame | None, games: pd.DataFrame
+) -> pd.DataFrame:
+    """Attach the day-window bullpen columns; NaN when no data was loaded."""
+    if bullpen is None or len(bullpen) == 0:
+        for side in ("home", "away"):
+            for name in ("bullpen_ip_l3d", "bullpen_b2b_flag", "bullpen_xfip_30d"):
+                frame[f"{side}_{name}"] = np.nan
+        return frame
+    return frame.merge(_bullpen_features(bullpen, games), on="event_id", how="left")
+
+
 def _merge_starter_features(
     frame: pd.DataFrame, pitching: pd.DataFrame | None
 ) -> pd.DataFrame:
     """Attach home_sp_*/away_sp_* columns; NaN block when no data exists."""
     if pitching is None or len(pitching) == 0:
         for side in ("home", "away"):
-            for name in SP_FEATURE_NAMES:
+            for name in (*SP_FEATURE_NAMES, "bullpen_ip_expected"):
                 frame[f"{side}_{name}"] = np.nan
         return frame
     sp = _starter_features(pitching)
@@ -398,7 +586,10 @@ def _merge_starter_features(
 
 
 def build_training_frame(
-    games: pd.DataFrame, market: str, pitching: pd.DataFrame | None = None
+    games: pd.DataFrame,
+    market: str,
+    pitching: pd.DataFrame | None = None,
+    bullpen: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Game rows with home_/away_ features, target and season.
 
@@ -406,11 +597,12 @@ def build_training_frame(
     defensive drop if scores are equal).
     market='f5_moneyline': target = home led after 5 innings; F5 ties (push)
     and games without F5 partials are dropped — a push is not a loss and
-    teaching the model otherwise would poison it.
+    teaching the model otherwise would poison it. The F5 vector EXCLUDES
+    the bullpen block by design (docs/04 §1.4).
 
-    ``pitching`` is ``load_pitching_frame``'s output; without it the sp_*
-    columns are NaN (the models impute, the report says so — never silently
-    fabricated).
+    ``pitching``/``bullpen`` are the loaders' outputs; without them the
+    corresponding columns are NaN (the models impute, the report says so —
+    never silently fabricated).
     """
     if market not in ("moneyline", "f5_moneyline"):
         raise ValueError(f"unknown market {market!r}")
@@ -431,6 +623,8 @@ def build_training_frame(
         right_on=["away_event_id", "away_team_id"],
     )
     frame = _merge_starter_features(frame, pitching)
+    if market == "moneyline":
+        frame = _merge_bullpen_features(frame, bullpen, games)
 
     if market == "moneyline":
         frame = frame[frame["home_score"] != frame["away_score"]].copy()
@@ -445,5 +639,5 @@ def build_training_frame(
 
     frame["season"] = frame["start_time_utc"].dt.year
     return frame[
-        ["event_id", "start_time_utc", "season", "target", *FEATURE_COLUMNS]
+        ["event_id", "start_time_utc", "season", "target", *feature_columns(market)]
     ].sort_values("start_time_utc").reset_index(drop=True)

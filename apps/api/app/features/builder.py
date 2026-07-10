@@ -11,9 +11,16 @@ own archive:
   probable is known the block is None — never fabricated. Training uses
   the actual starter instead (app/ml/dataset.py); that probable-vs-actual
   gap is a documented backtest approximation.
+- bullpen (§1.4, MONEYLINE ONLY): collective fatigue and quality from the
+  same archive's reliever lines (is_starter = false). The block is
+  excluded from the F5 vector by design — leverage bullpen does not
+  participate in innings 1-5 (docs/04 §1.4 rationale). Its windows use
+  CALENDAR DAYS (UTC) ending YESTERDAY, not timestamps: the intraday-safe
+  rule of §1.1 (we cannot guarantee that a doubleheader's game 1 finished
+  before decision time, so same-day games are excluded wholesale).
 
 NOT implemented yet (no placeholder numbers are fabricated for them):
-- bullpen availability (§1.4, ML only): TODO(F1)
+- closer_available_flag (§1.4): TODO(F1.2) — needs transactions/IL ingest
 - lineup / star-out flags (§1.5): TODO(F1)
 - park factors (§1.6) and weather (§1.7): TODO(F1)
 - TTO decay and fastball velocity delta (§1.3): TODO(F1.1) — need
@@ -35,7 +42,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import Table, func, select
+from sqlalchemy import Date, Table, cast, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection
 
@@ -67,6 +74,21 @@ SP_FEATURES = (
     "sp_days_rest",
     "sp_pitch_count_l2_starts",
     "sp_is_lhp",
+)
+
+# Bullpen block (docs/04 §1.4) — MONEYLINE ONLY, day-based windows.
+BULLPEN_FATIGUE_DAYS = 3
+BULLPEN_QUALITY_DAYS = 30
+BULLPEN_LEAGUE_DAYS = 365
+# "Played yesterday AND the bullpen actually worked": one full inning. A
+# named constant because docs/04 leaves the threshold open to tuning.
+BULLPEN_B2B_MIN_OUTS = 3
+
+BP_FEATURES = (
+    "bullpen_ip_l3d",
+    "bullpen_b2b_flag",
+    "bullpen_xfip_30d",
+    "bullpen_ip_expected",
 )
 
 FEATURE_TABLES = (
@@ -266,6 +288,117 @@ def _xfip_core(
     return (core + SP_SHRINK_IP * lg_xfip_core) / (innings + SP_SHRINK_IP)
 
 
+def _utc_day_expr(events: Table):
+    """SQL expression: the event's calendar date in UTC (for day windows)."""
+    return cast(func.timezone("UTC", events.c.start_time_utc), Date)
+
+
+def _league_bullpen(
+    conn: Connection,
+    t: dict[str, Table],
+    sport_id: uuid.UUID,
+    event_day,
+) -> dict[str, float] | None:
+    """As-of league rates over RELIEVER lines in the trailing year.
+
+    Separate from the starter league on purpose: reliever HR/FB and
+    xFIP-core run at different levels than starters', and mixing them
+    would bias the shrinkage target. Day-based window ending yesterday
+    (the block's intraday-safe rule)."""
+    events, logs = t["events"], t["pitching_game_logs"]
+    day = _utc_day_expr(events)
+    row = conn.execute(
+        select(
+            func.sum(logs.c.outs_recorded).label("outs"),
+            func.sum(logs.c.strikeouts).label("k"),
+            func.sum(logs.c.walks).label("bb"),
+            func.sum(logs.c.hit_batsmen).label("hbp"),
+            func.sum(logs.c.home_runs).label("hr"),
+            func.sum(_fb_expr(logs)).label("fb"),
+        )
+        .select_from(logs.join(events, events.c.id == logs.c.event_id))
+        .where(
+            events.c.sport_id == sport_id,
+            ~logs.c.is_starter,
+            day >= event_day - timedelta(days=BULLPEN_LEAGUE_DAYS),
+            day < event_day,
+        )
+    ).one()
+    if not row.outs or not row.fb:
+        return None
+    innings = row.outs / 3.0
+    return {
+        "lg_hrfb": row.hr / row.fb,
+        "lg_xfip_core": (13.0 * row.hr + 3.0 * (row.bb + row.hbp) - 2.0 * row.k) / innings,
+    }
+
+
+def _bullpen_block(
+    conn: Connection,
+    t: dict[str, Table],
+    team_id: uuid.UUID,
+    event_day,
+    league_bp: dict[str, float] | None,
+) -> dict[str, Any]:
+    """docs/04 §1.4 bullpen fatigue/quality for one team (MONEYLINE only).
+
+    ip_l3d and b2b are TRUE ZEROS when the team's relievers did not pitch
+    in the window (a rested bullpen, e.g. season opener) — but only while
+    the reliever archive is alive at all (``league_bp`` not None). With no
+    archived reliever lines in the trailing year, a zero would fabricate
+    "fully rested" where the truth is "no data": the whole block stays
+    None instead, mirroring the bulk path's NaN. Same-day games are
+    excluded wholesale (intraday-safe rule, §1.1)."""
+    if league_bp is None:
+        return {
+            "bullpen_ip_l3d": None,
+            "bullpen_b2b_flag": None,
+            "bullpen_xfip_30d": None,
+        }
+    events, logs = t["events"], t["pitching_game_logs"]
+    day = _utc_day_expr(events)
+    rows = conn.execute(
+        select(
+            day.label("day"),
+            logs.c.outs_recorded,
+            logs.c.strikeouts,
+            logs.c.walks,
+            logs.c.hit_batsmen,
+            _fb_expr(logs).label("fb"),
+        )
+        .select_from(logs.join(events, events.c.id == logs.c.event_id))
+        .where(
+            logs.c.team_id == team_id,
+            ~logs.c.is_starter,
+            day >= event_day - timedelta(days=BULLPEN_QUALITY_DAYS),
+            day < event_day,
+        )
+    ).all()
+
+    fatigue_floor = event_day - timedelta(days=BULLPEN_FATIGUE_DAYS)
+    yesterday = event_day - timedelta(days=1)
+    yesterday_outs = sum(r.outs_recorded for r in rows if r.day == yesterday)
+    block: dict[str, Any] = {
+        "bullpen_ip_l3d": _round(
+            sum(r.outs_recorded for r in rows if r.day >= fatigue_floor) / 3.0
+        ),
+        "bullpen_b2b_flag": int(yesterday_outs >= BULLPEN_B2B_MIN_OUTS),
+        "bullpen_xfip_30d": None,
+    }
+    if rows and league_bp is not None:
+        k = sum(r.strikeouts for r in rows)
+        bb_hbp = sum(r.walks + r.hit_batsmen for r in rows)
+        fb = sum(r.fb for r in rows)
+        innings = sum(r.outs_recorded for r in rows) / 3.0
+        block["bullpen_xfip_30d"] = _round(
+            _xfip_core(
+                k, bb_hbp, fb, innings,
+                league_bp["lg_hrfb"], league_bp["lg_xfip_core"],
+            )
+        )
+    return block
+
+
 def _starter_block(
     conn: Connection,
     t: dict[str, Table],
@@ -275,8 +408,16 @@ def _starter_block(
     as_of_ts: datetime,
     league: dict[str, float] | None,
 ) -> dict[str, Any]:
-    """docs/04 §1.3 starter features for one side, from the as-of probable."""
-    block: dict[str, Any] = {name: None for name in SP_FEATURES}
+    """docs/04 §1.3 starter features for one side, from the as-of probable.
+
+    Also emits ``bullpen_ip_expected`` (§1.4): the starter's mean innings
+    per start in the window — a short starter means more bullpen exposure.
+    It rides in this block because it is derived from the same rows;
+    build_features drops it from the F5 vector along with the rest of the
+    bullpen block."""
+    block: dict[str, Any] = {
+        name: None for name in (*SP_FEATURES, "bullpen_ip_expected")
+    }
     probable = _probable_player(conn, t, event_id, side, as_of_ts)
     if probable is None:
         return block
@@ -318,6 +459,10 @@ def _starter_block(
     ]
     if pitches:
         block["sp_pitch_count_l2_starts"] = int(sum(pitches))
+
+    block["bullpen_ip_expected"] = _round(
+        sum(r.outs_recorded for r in rows) / len(rows) / 3.0
+    )
 
     if league is None:
         return block
@@ -381,31 +526,42 @@ def build_features(
         )
 
     league = _league_pitching(conn, t, event.sport_id, as_of_ts)
+    sides = {}
+    for side, team_id in (("home", event.home_team_id), ("away", event.away_team_id)):
+        sides[side] = {
+            **_team_form(
+                conn, t, event.sport_id, team_id, event.start_time_utc, as_of_ts
+            ),
+            **_starter_block(
+                conn, t, event_id, side, event.start_time_utc, as_of_ts, league
+            ),
+        }
+
+    # Bullpen block enters the MONEYLINE vector only: leverage relievers do
+    # not participate in innings 1-5, so F5 excludes it BY DESIGN — the
+    # features are removed, not zero-weighted (docs/04 §1.4).
+    if market == "moneyline":
+        event_day = _utc_date(event.start_time_utc)
+        league_bp = _league_bullpen(conn, t, event.sport_id, event_day)
+        for side, team_id in (("home", event.home_team_id), ("away", event.away_team_id)):
+            sides[side].update(
+                _bullpen_block(conn, t, team_id, event_day, league_bp)
+            )
+    else:
+        for side in sides:
+            sides[side].pop("bullpen_ip_expected")
 
     # as_of_ts intentionally NOT included in the dict: it lives in its own
     # column, and keeping it out lets identical vectors captured at different
     # times dedupe on (event, market, feature_hash) as the schema intends.
     return {
-        "feature_version": "team_form_sp_v2",
+        "feature_version": "team_form_sp_bp_v3",
         "market": market,
-        "home": {
-            **_team_form(
-                conn, t, event.sport_id, event.home_team_id, event.start_time_utc, as_of_ts
-            ),
-            **_starter_block(
-                conn, t, event_id, "home", event.start_time_utc, as_of_ts, league
-            ),
-        },
-        "away": {
-            **_team_form(
-                conn, t, event.sport_id, event.away_team_id, event.start_time_utc, as_of_ts
-            ),
-            **_starter_block(
-                conn, t, event_id, "away", event.start_time_utc, as_of_ts, league
-            ),
-        },
-        # TODO(F1): bullpen, lineup, park, weather blocks (docs/04 §1.4-1.7)
-        # and TTO/velocity (§1.3). Absent on purpose — never fabricated.
+        "home": sides["home"],
+        "away": sides["away"],
+        # TODO(F1): lineup, park, weather blocks (docs/04 §1.5-1.7),
+        # closer_available_flag (§1.4) and TTO/velocity (§1.3). Absent on
+        # purpose — never fabricated.
     }
 
 

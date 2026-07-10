@@ -29,6 +29,8 @@ from app.config import get_settings
 from app.db.engine import make_engine
 from app.ml.dataset import (
     build_training_frame,
+    feature_columns,
+    load_bullpen_frame,
     load_market_prior,
     load_pitching_frame,
     load_results_frame,
@@ -41,6 +43,14 @@ def _sp_coverage(frame) -> float:
     both = (
         frame["home_sp_kbb_pct_l5_starts"].notna()
         & frame["away_sp_kbb_pct_l5_starts"].notna()
+    )
+    return round(float(both.mean()), 4) if len(frame) else 0.0
+
+
+def _bullpen_coverage(frame) -> float:
+    """Share of rows with a live reliever archive (fatigue features real)."""
+    both = (
+        frame["home_bullpen_ip_l3d"].notna() & frame["away_bullpen_ip_l3d"].notna()
     )
     return round(float(both.mean()), 4) if len(frame) else 0.0
 
@@ -70,13 +80,24 @@ def run(
         return out
 
     pitching = None
+    bullpen = None
     try:
         pitching = load_pitching_frame(engine)
+        bullpen = load_bullpen_frame(engine)
+        # Independent emptiness checks: starter and reliever coverage are
+        # separate archives from the model's point of view — never let one
+        # side's hole silently degrade the other's features.
         if len(pitching) == 0:
             pitching = None
             out["pitching_note"] = (
-                "pitching_game_logs is empty; run backfill_pitching "
-                "(sp_* features are all NaN this run)"
+                "pitching_game_logs has no starter lines; run "
+                "backfill_pitching (sp_* features are all NaN this run)"
+            )
+        if len(bullpen) == 0:
+            bullpen = None
+            out["bullpen_note"] = (
+                "pitching_game_logs has no reliever lines; run "
+                "backfill_pitching (bullpen_* features are all NaN this run)"
             )
     except (ProgrammingError, DatabaseError):
         # Table not there yet (pandas wraps the driver error in its own
@@ -84,14 +105,14 @@ def run(
         # and says so, instead of blocking on the migration.
         out["pitching_note"] = (
             "pitching tables missing; apply migration 003 and run "
-            "backfill_pitching (sp_* features are all NaN this run)"
+            "backfill_pitching (sp_*/bullpen_* features are all NaN this run)"
         )
 
     for market in markets:
-        frame = build_training_frame(games, market, pitching)
+        frame = build_training_frame(games, market, pitching, bullpen)
         prior = load_market_prior(engine, market)
         frame = frame.merge(prior, on="event_id", how="left")
-        out["markets"][market] = {
+        block = {
             "rows": int(len(frame)),
             "seasons": sorted(int(s) for s in frame["season"].unique()),
             # Share of rows with real starter features: after the full
@@ -99,8 +120,13 @@ def run(
             # pitching archive worth investigating before quoting metrics.
             "sp_coverage": _sp_coverage(frame),
             "rows_with_market_prior": int(frame["market_prior_p_home"].notna().sum()),
-            "report": walk_forward_report(frame, min_train_seasons),
+            "report": walk_forward_report(
+                frame, min_train_seasons, feature_columns(market)
+            ),
         }
+        if market == "moneyline":
+            block["bullpen_coverage"] = _bullpen_coverage(frame)
+        out["markets"][market] = block
     return out
 
 
@@ -109,10 +135,16 @@ def _markdown_summary(result: dict[str, Any]) -> str:
     if "pitching_note" in result:
         lines.append(f"> ⚠ {result['pitching_note']}")
         lines.append("")
+    if "bullpen_note" in result:
+        lines.append(f"> ⚠ {result['bullpen_note']}")
+        lines.append("")
     for market, block in result.get("markets", {}).items():
+        coverage = f"sp_coverage {block['sp_coverage']}"
+        if "bullpen_coverage" in block:
+            coverage += f", bullpen_coverage {block['bullpen_coverage']}"
         lines.append(
             f"### {market} — {block['rows']} juegos, temporadas {block['seasons']}, "
-            f"sp_coverage {block['sp_coverage']}"
+            f"{coverage}"
         )
         lines.append("")
         lines.append("| Test | n | const LL | home_rate LL | logistic LL | hist_gb LL | logistic ECE | hist_gb ECE |")

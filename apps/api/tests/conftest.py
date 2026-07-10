@@ -67,6 +67,7 @@ def seeded(db):
 
     H, A, X = "Boston Red Sox", "New York Yankees", "Tampa Bay Rays"
     SP1, SP2 = 500001, 500002  # X's righty ace, H's lefty
+    R1, R2, R3 = 700101, 700102, 700103  # relievers: X, H, X
 
     def _game(pk, start, home, away, status="final"):
         return ScheduledGame(
@@ -128,6 +129,9 @@ def seeded(db):
             [
                 {"mlb_person_id": SP1, "full_name": "Righty Ace", "pitch_hand": "R"},
                 {"mlb_person_id": SP2, "full_name": "Lefty Homegrown", "pitch_hand": "L"},
+                {"mlb_person_id": R1, "full_name": "Setup Righty", "pitch_hand": "R"},
+                {"mlb_person_id": R2, "full_name": "Long Man", "pitch_hand": "L"},
+                {"mlb_person_id": R3, "full_name": "Mopup Arm", "pitch_hand": "R"},
             ],
             player_cache,
         )
@@ -146,14 +150,39 @@ def seeded(db):
             conn, tables, e900001, teams[H], teams[X],
             [_line(SP2, True, True, 15, 20, 7, 3, 1, 0, 4, 0, None)], player_cache,
         )
-        # The July 6th game itself: SP1 started for X (home), SP2 for H (away).
+        # The July 6th game itself: SP1 started for X (home), SP2 for H
+        # (away), and X's reliever R3 pitched in relief — that same-day
+        # line must NEVER enter the July 6th bullpen windows (intraday-safe
+        # rule) nor the starter block (strict < start).
         store.bulk_upsert_pitching_logs(
             conn, tables, e900002, teams[X], teams[H],
             [
                 _line(SP1, True, True, 16, 22, 5, 1, 0, 1, 4, 0, 90),
                 _line(SP2, False, True, 14, 19, 6, 2, 0, 1, 3, 1, 85),
+                _line(R3, True, False, 3, 4, 1, 0, 0, 0, 1, 0, 15),
             ],
             player_cache,
+        )
+        # --- Bullpen seeds (docs/04 §1.4, for the July 6th game: D=Jul 6,
+        # 30d window = Jun 6..Jul 5, fatigue = Jul 3..Jul 5) -----------------
+        # X bullpen: 9 outs on Jul 4 + 6 outs on Jul 5 (b2b) ...
+        store.bulk_upsert_pitching_logs(
+            conn, tables, e900005, teams[A], teams[X],
+            [_line(R1, False, False, 9, 12, 2, 3, 0, 1, 4, 0, 30)], player_cache,
+        )
+        store.bulk_upsert_pitching_logs(
+            conn, tables, e900001, teams[H], teams[X],
+            [_line(R1, False, False, 6, 8, 3, 1, 0, 0, 2, 0, 25)], player_cache,
+        )
+        # ...and a June 5th line JUST outside the 30d window (boundary).
+        store.bulk_upsert_pitching_logs(
+            conn, tables, e900003, teams[H], teams[X],
+            [_line(R3, False, False, 3, 4, 2, 0, 0, 0, 1, 0, 12)], player_cache,
+        )
+        # H bullpen: exactly 3 outs yesterday — the b2b threshold edge.
+        store.bulk_upsert_pitching_logs(
+            conn, tables, e900001, teams[H], teams[X],
+            [_line(R2, True, False, 3, 5, 1, 2, 1, 1, 1, 1, 20)], player_cache,
         )
         # Probables announced the morning of July 6th, matching the starters.
         store.record_probables(

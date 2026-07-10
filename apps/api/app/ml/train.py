@@ -90,7 +90,9 @@ def _metrics(y: np.ndarray, p: np.ndarray) -> dict[str, float]:
 
 
 def _prep_matrix(
-    frame: pd.DataFrame, medians: pd.Series | None = None
+    frame: pd.DataFrame,
+    columns: list[str],
+    medians: pd.Series | None = None,
 ) -> tuple[np.ndarray, pd.Series]:
     """Median-impute NaNs (medians learned on train only — no leakage).
 
@@ -98,7 +100,7 @@ def _prep_matrix(
     before the pitching backfill runs) has NaN median; it falls back to 0.0
     so sklearn still fits — the report's sp_coverage exposes the situation.
     """
-    x = frame[FEATURE_COLUMNS]
+    x = frame[columns]
     if medians is None:
         medians = x.median().fillna(0.0)
     return x.fillna(medians).to_numpy(dtype=float), medians
@@ -115,9 +117,22 @@ def _expanding_home_rate(frame: pd.DataFrame) -> np.ndarray:
 
 
 def walk_forward_report(
-    frame: pd.DataFrame, min_train_seasons: int = MIN_TRAIN_SEASONS
+    frame: pd.DataFrame,
+    min_train_seasons: int = MIN_TRAIN_SEASONS,
+    feature_columns: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Train/evaluate per test season; returns nested metrics."""
+    """Train/evaluate per test season; returns nested metrics.
+
+    ``feature_columns`` selects the vector (markets differ: F5 excludes the
+    bullpen block). Default: every FEATURE_COLUMNS entry present in the
+    frame, in canonical order — so a frame built for either market trains
+    on exactly its own columns.
+    """
+    columns = (
+        list(feature_columns)
+        if feature_columns is not None
+        else [c for c in FEATURE_COLUMNS if c in frame.columns]
+    )
     # Plain ints: numpy int32 seasons would survive into the report and
     # break json.dumps at the very end of a long training run.
     seasons = sorted(int(s) for s in frame["season"].unique())
@@ -138,9 +153,9 @@ def walk_forward_report(
         if len(y_test) == 0:
             continue
 
-        x_fit, medians = _prep_matrix(frame.loc[fit_mask])
-        x_calib, _ = _prep_matrix(frame.loc[calib_mask], medians)
-        x_test, _ = _prep_matrix(frame.loc[test_mask], medians)
+        x_fit, medians = _prep_matrix(frame.loc[fit_mask], columns)
+        x_calib, _ = _prep_matrix(frame.loc[calib_mask], columns, medians)
+        x_test, _ = _prep_matrix(frame.loc[test_mask], columns, medians)
 
         season_report: dict[str, Any] = {
             "train_seasons": train_seasons,

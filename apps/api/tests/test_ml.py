@@ -194,6 +194,91 @@ class TestStarterFeatures:
         assert self._by_event()["g0"]["sp_is_lhp"] == 1.0
 
 
+def _synthetic_bullpen() -> pd.DataFrame:
+    """One team's relievers ('the league'): 6 outs on 06-01, 2 on 06-02."""
+    rows = [
+        dict(team_id="T1",
+             start_time_utc=datetime(2024, 6, 1, 23, 0, tzinfo=timezone.utc),
+             outs_recorded=6, strikeouts=4, walks=1, hit_batsmen=0,
+             home_runs=1, fly_outs=3, sac_flies=0),
+        dict(team_id="T1",
+             start_time_utc=datetime(2024, 6, 2, 23, 0, tzinfo=timezone.utc),
+             outs_recorded=2, strikeouts=1, walks=1, hit_batsmen=0,
+             home_runs=0, fly_outs=1, sac_flies=0),
+    ]
+    return pd.DataFrame(rows)
+
+
+def _bullpen_games() -> pd.DataFrame:
+    games = pd.DataFrame(
+        [
+            dict(event_id="g1", home_team_id="T1", away_team_id="T2",
+                 start_time_utc=datetime(2024, 6, 3, 20, 0, tzinfo=timezone.utc)),
+            dict(event_id="g2", home_team_id="T1", away_team_id="T2",
+                 start_time_utc=datetime(2024, 6, 2, 12, 0, tzinfo=timezone.utc)),
+        ]
+    )
+    games["start_time_utc"] = pd.to_datetime(games["start_time_utc"], utc=True)
+    return games
+
+
+class TestBullpenFeatures:
+    def _rows(self):
+        feats = ds._bullpen_features(_synthetic_bullpen(), _bullpen_games())
+        return {row["event_id"]: row for _, row in feats.iterrows()}
+
+    def test_fatigue_and_b2b_threshold(self):
+        g1 = self._rows()["g1"]  # D = 06-03: both lines in [D-3, D-1]
+        assert g1["home_bullpen_ip_l3d"] == pytest.approx(round(8 / 3, 4))
+        # Yesterday (06-02) the bullpen threw 2 outs < 3: NOT back-to-back.
+        assert g1["home_bullpen_b2b_flag"] == 0.0
+
+    def test_same_day_lines_are_excluded(self):
+        # g2 is played on 06-02: that day's 2-out line must not count
+        # (intraday-safe rule) — only 06-01 enters the windows.
+        g2 = self._rows()["g2"]
+        assert g2["home_bullpen_ip_l3d"] == 2.0
+        assert g2["home_bullpen_b2b_flag"] == 1.0  # 6 outs on 06-01
+
+    def test_xfip_hand_computed(self):
+        # g2's league = the 06-01 line only: HR 1, FB 4, K 4, BB+HBP 1, IP 2.
+        g2 = self._rows()["g2"]
+        lg_hrfb, lg_core = 1 / 4, (13 * 1 + 3 * 1 - 2 * 4) / 2.0
+        expected = (13 * 4 * lg_hrfb + 3 * 1 - 2 * 4 + 15 * lg_core) / (2 + 15)
+        assert g2["home_bullpen_xfip_30d"] == pytest.approx(round(expected, 4))
+
+    def test_team_without_lines_rests_at_zero_but_quality_unknown(self):
+        g1 = self._rows()["g1"]
+        assert g1["away_bullpen_ip_l3d"] == 0.0
+        assert g1["away_bullpen_b2b_flag"] == 0.0
+        assert pd.isna(g1["away_bullpen_xfip_30d"])  # no sample: unknown
+
+    def test_game_before_the_archive_is_alive_stays_nan(self):
+        # A game on the archive's very first day has an empty as-of league:
+        # zeros would fabricate 'fully rested' where the truth is 'no data'.
+        games = _bullpen_games()
+        games.loc[len(games)] = dict(
+            event_id="g0", home_team_id="T1", away_team_id="T2",
+            start_time_utc=datetime(2024, 6, 1, 12, 0, tzinfo=timezone.utc),
+        )
+        feats = ds._bullpen_features(_synthetic_bullpen(), games)
+        g0 = feats[feats["event_id"] == "g0"].iloc[0]
+        for side in ("home", "away"):
+            assert pd.isna(g0[f"{side}_bullpen_ip_l3d"])
+            assert pd.isna(g0[f"{side}_bullpen_b2b_flag"])
+            assert pd.isna(g0[f"{side}_bullpen_xfip_30d"])
+
+    def test_f5_frame_carries_no_bullpen_columns(self):
+        games = _synthetic_games(n_seasons=2, per_season=60)
+        f5 = ds.build_training_frame(games, "f5_moneyline")
+        ml = ds.build_training_frame(games, "moneyline")
+        assert not any("bullpen" in c for c in f5.columns)
+        assert sum("bullpen" in c for c in ml.columns) == 8
+        assert len(ds.FEATURE_COLUMNS) == 40
+        assert len(ds.F5_FEATURE_COLUMNS) == 32
+        assert ds.feature_columns("f5_moneyline") == ds.F5_FEATURE_COLUMNS
+
+
 class TestMarketPriorSubset:
     def _frame(self):
         return ds.build_training_frame(_synthetic_games(), "moneyline")
@@ -300,6 +385,9 @@ def test_train_f1_job_reports_sp_coverage(seeded):
     # history (SP1's June 5th start has no priors at all).
     assert block["rows"] == 5
     assert block["sp_coverage"] == 0.2
+    # Reliever archive comes alive after June 5th: 4 of 5 games covered.
+    assert block["bullpen_coverage"] == 0.8
+    assert "bullpen_coverage" not in result["markets"]["f5_moneyline"]
     # Not enough seasons to test anything: the report stays honest and empty.
     assert block["report"]["seasons"] == {}
 
@@ -313,7 +401,7 @@ def test_bulk_features_match_online_builder(seeded):
     from app.features import builder
     from app.ml.dataset import build_training_frame, load_results_frame
 
-    from app.ml.dataset import load_pitching_frame
+    from app.ml.dataset import load_bullpen_frame, load_pitching_frame
 
     db, tables, target_id = seeded
     games = load_results_frame(db)
@@ -321,8 +409,12 @@ def test_bulk_features_match_online_builder(seeded):
     # The online builder computed the July 5th game's form for team H; the
     # bulk frame's row for that same game must match field by field. The
     # seeded probables MATCH the actual starters, so the starter block must
-    # agree too (probable-based online vs actual-starter bulk).
-    frame = build_training_frame(games, "moneyline", pitching=load_pitching_frame(db))
+    # agree too (probable-based online vs actual-starter bulk). The bullpen
+    # block (day windows) must agree as well.
+    frame = build_training_frame(
+        games, "moneyline",
+        pitching=load_pitching_frame(db), bullpen=load_bullpen_frame(db),
+    )
     with db.connect() as conn:
         # as_of == start time (training convention) for the July 6th game,
         # where team H (away side) has exactly one prior game in window.
@@ -339,6 +431,7 @@ def test_bulk_features_match_online_builder(seeded):
         "f5_games_30d", "f5_runs_pg_30d", "f5_runs_allowed_pg_30d",
         "rest_days", "games_last_7d",
         *ds.SP_FEATURE_NAMES,
+        *ds.BP_FEATURE_NAMES,
     ):
         for side in ("home", "away"):
             online_val = online[side][name]
