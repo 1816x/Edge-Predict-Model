@@ -35,6 +35,17 @@ posterior a estas decisiones debe registrarse aquí con fecha y razón.
   referencia no-vig para F5 será el consenso de books US. Paso de verificación concreto en
   `02-fuentes-de-datos.md`.
 
+## Addenda (2026-07-10)
+
+- **Producto bilingüe ES/EN desde el diseño**: el dashboard y toda la capa de producto (F3)
+  se construyen con i18n desde el día uno — español como mercado primario (gran parte del
+  público apostador objetivo no lee inglés) e inglés para alcance. El motor cuantitativo ya
+  es neutro al idioma (features, schema y código en inglés, decisión de `04` §1.1); lo que se
+  internacionaliza es la UI (`apps/web`, hoy `lang="es"`), las explicaciones de picks que
+  genera el LLM (parámetro de idioma por usuario) y los disclaimers/legales — estos últimos
+  varían por jurisdicción, no solo por idioma, y se resuelven en la revisión legal de F3
+  junto con la decisión #5. Los docs internos y la operación siguen en español.
+
 ## Principios no negociables (del brief original)
 
 - No se promete rentabilidad. El producto vende claridad, control de riesgo y trazabilidad.
