@@ -79,6 +79,7 @@ SP_FEATURES = (
 # Bullpen block (docs/04 §1.4) — MONEYLINE ONLY, day-based windows.
 BULLPEN_FATIGUE_DAYS = 3
 BULLPEN_QUALITY_DAYS = 30
+BULLPEN_LEAGUE_DAYS = 365
 # "Played yesterday AND the bullpen actually worked": one full inning. A
 # named constant because docs/04 leaves the threshold open to tuning.
 BULLPEN_B2B_MIN_OUTS = 3
@@ -319,7 +320,7 @@ def _league_bullpen(
         .where(
             events.c.sport_id == sport_id,
             ~logs.c.is_starter,
-            day >= event_day - timedelta(days=365),
+            day >= event_day - timedelta(days=BULLPEN_LEAGUE_DAYS),
             day < event_day,
         )
     ).one()
@@ -342,9 +343,18 @@ def _bullpen_block(
     """docs/04 §1.4 bullpen fatigue/quality for one team (MONEYLINE only).
 
     ip_l3d and b2b are TRUE ZEROS when the team's relievers did not pitch
-    in the window (a rested bullpen, e.g. season opener) — unlike the
-    quality rate, which stays None without sample. Same-day games are
+    in the window (a rested bullpen, e.g. season opener) — but only while
+    the reliever archive is alive at all (``league_bp`` not None). With no
+    archived reliever lines in the trailing year, a zero would fabricate
+    "fully rested" where the truth is "no data": the whole block stays
+    None instead, mirroring the bulk path's NaN. Same-day games are
     excluded wholesale (intraday-safe rule, §1.1)."""
+    if league_bp is None:
+        return {
+            "bullpen_ip_l3d": None,
+            "bullpen_b2b_flag": None,
+            "bullpen_xfip_30d": None,
+        }
     events, logs = t["events"], t["pitching_game_logs"]
     day = _utc_day_expr(events)
     rows = conn.execute(

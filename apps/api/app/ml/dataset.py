@@ -453,8 +453,11 @@ def _bullpen_features(bullpen: pd.DataFrame, games: pd.DataFrame) -> pd.DataFram
 
     Windows are UTC calendar days ending YESTERDAY relative to each game's
     day (intraday-safe rule). ip_l3d/b2b are TRUE ZEROS when the team's
-    relievers did not pitch in the window; the quality rate stays NaN
-    without sample or without a reliever league to shrink toward.
+    relievers did not pitch in the window — but only while the reliever
+    archive is alive at that date (a valid as-of league): games before the
+    first archived reliever line stay NaN, or a partial archive would
+    fabricate "fully rested" bullpens season-wide. The quality rate stays
+    NaN without sample. Mirrors builder._bullpen_block exactly.
     """
     bp = bullpen.sort_values("start_time_utc").reset_index(drop=True)
     days = _utc_epoch_days(bp["start_time_utc"])
@@ -512,6 +515,8 @@ def _bullpen_features(bullpen: pd.DataFrame, games: pd.DataFrame) -> pd.DataFram
     for i in range(len(games)):
         day = int(game_days[i])
         league = _league_at(day)
+        if league is None:
+            continue  # archive not alive yet at this date: NaN, not zeros
         for side in ("home", "away"):
             t = teams.get(team_cols[side][i])
             if t is None:

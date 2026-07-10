@@ -253,6 +253,21 @@ class TestBullpenFeatures:
         assert g1["away_bullpen_b2b_flag"] == 0.0
         assert pd.isna(g1["away_bullpen_xfip_30d"])  # no sample: unknown
 
+    def test_game_before_the_archive_is_alive_stays_nan(self):
+        # A game on the archive's very first day has an empty as-of league:
+        # zeros would fabricate 'fully rested' where the truth is 'no data'.
+        games = _bullpen_games()
+        games.loc[len(games)] = dict(
+            event_id="g0", home_team_id="T1", away_team_id="T2",
+            start_time_utc=datetime(2024, 6, 1, 12, 0, tzinfo=timezone.utc),
+        )
+        feats = ds._bullpen_features(_synthetic_bullpen(), games)
+        g0 = feats[feats["event_id"] == "g0"].iloc[0]
+        for side in ("home", "away"):
+            assert pd.isna(g0[f"{side}_bullpen_ip_l3d"])
+            assert pd.isna(g0[f"{side}_bullpen_b2b_flag"])
+            assert pd.isna(g0[f"{side}_bullpen_xfip_30d"])
+
     def test_f5_frame_carries_no_bullpen_columns(self):
         games = _synthetic_games(n_seasons=2, per_season=60)
         f5 = ds.build_training_frame(games, "f5_moneyline")
@@ -370,6 +385,9 @@ def test_train_f1_job_reports_sp_coverage(seeded):
     # history (SP1's June 5th start has no priors at all).
     assert block["rows"] == 5
     assert block["sp_coverage"] == 0.2
+    # Reliever archive comes alive after June 5th: 4 of 5 games covered.
+    assert block["bullpen_coverage"] == 0.8
+    assert "bullpen_coverage" not in result["markets"]["f5_moneyline"]
     # Not enough seasons to test anything: the report stays honest and empty.
     assert block["report"]["seasons"] == {}
 

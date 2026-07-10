@@ -102,6 +102,27 @@ def test_starter_block_hand_computed_values(seeded):
     assert features["feature_version"] == "team_form_sp_bp_v3"
 
 
+def test_bullpen_block_is_none_before_the_archive_is_alive(seeded):
+    """June 5th: no reliever line exists in the trailing year (R3's own
+    same-day line doesn't count) — the block must be None, NOT a fabricated
+    'fully rested' zero. Zeros are only true while the archive is alive."""
+    from sqlalchemy import text
+
+    db, tables, _ = seeded
+    with db.connect() as conn:
+        event_id = conn.execute(
+            text("SELECT id FROM events WHERE external_ids ->> 'mlb_game_pk' = '900003'")
+        ).scalar_one()
+        features = builder.build_features(
+            conn, tables, event_id, "moneyline",
+            datetime(2026, 6, 5, 23, 0, tzinfo=timezone.utc),
+        )
+    for side in ("home", "away"):
+        assert features[side]["bullpen_ip_l3d"] is None
+        assert features[side]["bullpen_b2b_flag"] is None
+        assert features[side]["bullpen_xfip_30d"] is None
+
+
 def test_f5_vector_excludes_bullpen_by_design(seeded):
     """docs/04 §1.4: bullpen features are REMOVED from F5, not zero-weighted."""
     from sqlalchemy import text
