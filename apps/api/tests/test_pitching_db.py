@@ -96,11 +96,21 @@ def test_backfill_pitching_ingests_resumes_and_forces(db):
     assert summary["missing_events"] == ["910003"]
     assert summary["parse_anomalies_total"] > 0
     # Hands: Crawford came with the boxscore, the other two via /people.
+    # The batters (700010/700011/700021) must NOT appear in people lookups:
+    # position players would multiply the calls for a field no batting
+    # feature reads.
     assert summary["hands_backfilled"] == 2
     assert client.people_calls == [[700001, 700002]]
+    # Batting rides the same fetch: 3 kept lines per boxscore (broken
+    # batter dropped with anomaly, pinch runner skipped as zero-PA).
+    assert summary["batting_lines_upserted"] == 6
+    assert summary["batting_zero_pa_skipped"] == 2
+    assert summary["batting_anomalies_total"] == 2
+    assert "batting_note" not in summary
 
     with db.connect() as conn:
         assert conn.execute(text("SELECT count(*) FROM pitching_game_logs")).scalar() == 6
+        assert conn.execute(text("SELECT count(*) FROM batting_game_logs")).scalar() == 6
         starters = conn.execute(
             text(
                 """
@@ -116,7 +126,11 @@ def test_backfill_pitching_ingests_resumes_and_forces(db):
         hands = dict(
             conn.execute(text("SELECT mlb_person_id, pitch_hand FROM players")).all()
         )
-        assert hands == {608566: "R", 700001: "R", 700002: "L"}
+        # Pitchers resolved; batters stored with hand NULL (never asked).
+        assert hands == {
+            608566: "R", 700001: "R", 700002: "L",
+            700010: None, 700011: None, 700021: None,
+        }
         outs = conn.execute(
             text(
                 """
@@ -127,6 +141,17 @@ def test_backfill_pitching_ingests_resumes_and_forces(db):
             )
         ).scalar()
         assert outs == 17  # "5.2" IP
+        catcher = conn.execute(
+            text(
+                """
+                SELECT b.at_bats, b.doubles, b.home_runs, b.walks,
+                       b.batting_order, b.plate_appearances
+                FROM batting_game_logs b JOIN players p ON p.id = b.player_id
+                WHERE p.mlb_person_id = 700010 LIMIT 1
+                """
+            )
+        ).one()
+        assert tuple(catcher) == (4, 1, 1, 1, 200, 5)
 
     # Resume: everything already ingested is skipped without HTTP.
     rerun = backfill_pitching.run(
@@ -134,6 +159,31 @@ def test_backfill_pitching_ingests_resumes_and_forces(db):
     )
     assert rerun["boxscores_fetched"] == 0
     assert rerun["events_skipped_existing"] == 2
+
+    # Historical-fill path: an event with pitching but no batting (the
+    # state of the whole 2018-2026 archive when migration 004 lands) is
+    # pending again, re-fetches ONCE and writes only the batting half.
+    with db.begin() as conn:
+        conn.execute(
+            text(
+                """
+                DELETE FROM batting_game_logs WHERE event_id IN (
+                    SELECT id FROM events
+                    WHERE external_ids ->> 'mlb_game_pk' = '910001'
+                )
+                """
+            )
+        )
+    refill = backfill_pitching.run(
+        "2024-06-01", "2024-06-01", client=client, engine=db, sleep_seconds=0
+    )
+    assert refill["boxscores_fetched"] == 1
+    assert refill["events_skipped_existing"] == 1
+    assert refill["batting_lines_upserted"] == 3
+    assert refill["lines_upserted"] == 0  # pitching half untouched
+    with db.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM pitching_game_logs")).scalar() == 6
+        assert conn.execute(text("SELECT count(*) FROM batting_game_logs")).scalar() == 6
 
     # Force: re-fetches, upserts in place (no duplicate rows), and the hands
     # already stored are not re-asked to /people.
@@ -145,6 +195,7 @@ def test_backfill_pitching_ingests_resumes_and_forces(db):
     assert len(client.people_calls) == people_calls_before
     with db.connect() as conn:
         assert conn.execute(text("SELECT count(*) FROM pitching_game_logs")).scalar() == 6
+        assert conn.execute(text("SELECT count(*) FROM batting_game_logs")).scalar() == 6
 
 
 @pytest.mark.integration
@@ -233,6 +284,35 @@ def test_placeholder_name_never_clobbers_real_name(db):
             conn.execute(text("SELECT mlb_person_id, full_name FROM players")).all()
         )
     assert names == {1: "Zack Wheeler", 2: "MLB person 2"}
+
+
+@pytest.mark.integration
+def test_backfill_degrades_to_pitching_only_without_migration_004(db):
+    """Pre-004 window (code merged, migration not applied yet): the batting
+    half degrades to a note and pitching ingestion continues untouched —
+    the daily cron must warn, never paint the whole run red."""
+    from pathlib import Path
+
+    from sqlalchemy import text as sql_text
+
+    from app.jobs import apply_migration
+
+    _seed_events(db, [910001])
+    client = FakeMlbClient([_schedule_game(910001, "2024-06-01")])
+    with db.begin() as conn:
+        conn.execute(sql_text("DROP TABLE batting_game_logs"))
+    try:
+        summary = backfill_pitching.run(
+            "2024-06-01", "2024-06-01", client=client, engine=db, sleep_seconds=0
+        )
+        assert "apply migration 004" in summary["batting_note"]
+        assert summary["lines_upserted"] == 3  # pitching half fully ingested
+        assert summary["batting_lines_upserted"] == 0
+    finally:
+        migration = (
+            Path(__file__).parents[3] / "infra" / "migrations" / "004-batting-game-logs.sql"
+        )
+        apply_migration.run(str(migration), engine=db)
 
 
 @pytest.mark.integration

@@ -280,6 +280,144 @@ class BoxscorePitching:
     anomalies: tuple[str, ...]  # surfaced in job summaries, never silent
 
 
+@dataclass(frozen=True)
+class BattingLine:
+    """One batter's line in one game, from the boxscore endpoint.
+
+    Only batters with a nonzero DERIVED plate-appearance count
+    (AB + BB + HBP + SF + SH) are emitted: pinch runners and defensive
+    substitutions contribute nothing to any rate feature. Counting events
+    the feed omits when zero (doubles, triples, home runs, IBB, HBP, SF,
+    SH) become true zeros; a missing required core stat (atBats, hits,
+    strikeOuts, baseOnBalls) drops the line with an anomaly instead — a
+    fabricated zero in a denominator would poison wOBA/K%/BB% silently.
+    ``plate_appearances`` and ``batting_order`` are audit fields (None
+    when absent), never feature denominators.
+    """
+
+    mlb_person_id: int
+    full_name: str
+    is_home: bool
+    at_bats: int
+    hits: int
+    doubles: int
+    triples: int
+    home_runs: int
+    walks: int
+    intentional_walks: int
+    strikeouts: int
+    hit_by_pitch: int
+    sac_flies: int
+    sac_bunts: int
+    batting_order: int | None
+    plate_appearances: int | None
+
+
+@dataclass(frozen=True)
+class BoxscoreBatting:
+    """All batting lines of one game plus anomalies and normal skips."""
+
+    lines: tuple[BattingLine, ...]
+    anomalies: tuple[str, ...]  # surfaced in job summaries, never silent
+    zero_pa_skipped: int  # normal exclusions (pinch runners), not anomalies
+
+
+def parse_boxscore_batting(payload: dict[str, Any]) -> BoxscoreBatting:
+    """Normalize ``GET /api/v1/game/{gamePk}/boxscore`` batting lines.
+
+    Rules:
+    - Every player with a non-empty ``stats.batting`` block is considered
+      (pitchers who batted included — their PAs were real offense).
+    - Required: atBats, hits, strikeOuts, baseOnBalls; a line missing any
+      is dropped with an anomaly (they feed every denominator).
+    - Omission means zero for counting events: doubles, triples, homeRuns,
+      intentionalWalks, hitByPitch, sacFlies, sacBunts.
+    - Internally inconsistent lines (hits > AB, XBH > hits, IBB > BB) are
+      dropped with an anomaly — the DB CHECKs would reject them anyway;
+      better one loud line than a poisoned chunk.
+    - Zero derived-PA lines are skipped and counted, not flagged.
+    - A side whose batting section yields zero kept lines is an anomaly:
+      that is exactly what a field-name drift in the feed would look
+      like, and it must be loud, not silent.
+    """
+    lines: list[BattingLine] = []
+    anomalies: list[str] = []
+    zero_pa = 0
+
+    for side_key, is_home in (("home", True), ("away", False)):
+        side = (payload.get("teams") or {}).get(side_key) or {}
+        considered = kept = 0
+        for entry in (side.get("players") or {}).values():
+            stats = ((entry.get("stats") or {}).get("batting")) or {}
+            if not stats:
+                continue
+            person = entry.get("person") or {}
+            pid = person.get("id")
+            if pid is None:
+                anomalies.append(f"{side_key}:batting_line_without_person_id")
+                continue
+            pid = int(pid)
+            considered += 1
+            required = {
+                k: stats.get(k) for k in ("atBats", "hits", "strikeOuts", "baseOnBalls")
+            }
+            missing = [k for k, v in required.items() if v is None]
+            if missing:
+                anomalies.append(f"{side_key}:{pid}:batting_missing:{','.join(missing)}")
+                continue
+            _zero = lambda key: int(stats.get(key) or 0)  # noqa: E731
+            at_bats, hits = int(stats["atBats"]), int(stats["hits"])
+            walks, strikeouts = int(stats["baseOnBalls"]), int(stats["strikeOuts"])
+            doubles, triples = _zero("doubles"), _zero("triples")
+            home_runs = _zero("homeRuns")
+            intentional_walks, hit_by_pitch = _zero("intentionalWalks"), _zero("hitByPitch")
+            sac_flies, sac_bunts = _zero("sacFlies"), _zero("sacBunts")
+            if (
+                hits > at_bats
+                or doubles + triples + home_runs > hits
+                or intentional_walks > walks
+            ):
+                anomalies.append(f"{side_key}:{pid}:batting_inconsistent")
+                continue
+            if at_bats + walks + hit_by_pitch + sac_flies + sac_bunts == 0:
+                zero_pa += 1
+                continue
+            try:
+                batting_order = int(entry.get("battingOrder"))
+            except (TypeError, ValueError):
+                batting_order = None
+            if batting_order is not None and batting_order < 100:
+                batting_order = None  # sub-100 slots are junk, not lineup data
+            pa = stats.get("plateAppearances")
+            kept += 1
+            lines.append(
+                BattingLine(
+                    mlb_person_id=pid,
+                    full_name=person.get("fullName") or f"MLB person {pid}",
+                    is_home=is_home,
+                    at_bats=at_bats,
+                    hits=hits,
+                    doubles=doubles,
+                    triples=triples,
+                    home_runs=home_runs,
+                    walks=walks,
+                    intentional_walks=intentional_walks,
+                    strikeouts=strikeouts,
+                    hit_by_pitch=hit_by_pitch,
+                    sac_flies=sac_flies,
+                    sac_bunts=sac_bunts,
+                    batting_order=batting_order,
+                    plate_appearances=None if pa is None or int(pa) < 0 else int(pa),
+                )
+            )
+        if considered and not kept:
+            anomalies.append(f"{side_key}:no_batting_lines_kept")
+
+    return BoxscoreBatting(
+        lines=tuple(lines), anomalies=tuple(anomalies), zero_pa_skipped=zero_pa
+    )
+
+
 def _outs_from_stats(stats: dict[str, Any]) -> int | None:
     """Outs recorded: the ``outs`` stat, else parsed from ``inningsPitched``.
 

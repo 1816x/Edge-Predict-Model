@@ -1,20 +1,32 @@
-"""Pitching game logs backfill + daily incremental (F1 starter block).
+"""Full-boxscore backfill + daily incremental: pitching AND batting lines.
 
-Walks a date range against the MLB schedule, fetches one boxscore per
-finished regular-season game and upserts players and pitching lines
-(``infra/migrations/003``). With NO arguments it processes yesterday (UTC):
-the daily cron and the historical backfill are the same idempotent job.
+Walks a date range against the MLB schedule, fetches ONE boxscore per
+finished regular-season game and upserts players, pitching lines
+(``infra/migrations/003``, F1 starter/bullpen blocks) and batting lines
+(``infra/migrations/004``, F1.2 offense block). With NO arguments it
+processes yesterday (UTC): the daily cron and the historical backfill are
+the same idempotent job. The module keeps its historical name — the
+workflow dispatch option and years of run logs point here.
 
-Resume-cheap by design: events that already have pitching logs are skipped
-(one query per chunk), so re-launching a season after a timeout re-fetches
-only what is missing. ``--force`` re-fetches everything in range (boxscore
-corrections).
+Resume-cheap by design, PER TABLE: an event is pending if it is missing
+pitching logs OR batting logs, and only the missing half is parsed and
+upserted from the (single) fetch. That is what makes the historical
+batting fill cheap to express: re-running a season that already has
+pitching re-fetches each boxscore once and writes only batting.
+``--force`` re-fetches everything in range and replaces both tables'
+rows (boxscore corrections can REMOVE lines; upserts alone never
+converge on that).
+
+Degradation contract: with migration 004 not applied yet, the batting
+half is skipped with ``batting_note`` and pitching ingestion continues
+untouched — the daily cron must warn, never paint the whole run red.
 
 Cost: one schedule call per chunk plus one boxscore call per pending game
 (~2,430/season, ~20-25 min per season with the politeness delay — fits the
 workflow's 60-minute timeout one season at a time). Pitch hands come from
-batched ``/api/v1/people`` lookups, only for pitchers whose hand is still
-unknown.
+batched ``/api/v1/people`` lookups, only for players who actually PITCHED
+and whose hand is still unknown — position players never trigger people
+lookups (their batting side does not care about pitch hand).
 
 Usage::
 
@@ -38,7 +50,11 @@ from app.config import get_settings
 from app.db.engine import make_engine
 from app.ingestion import store
 from app.ingestion.mlb_client import MlbClient
-from app.ingestion.parsers import parse_boxscore_pitching, parse_schedule
+from app.ingestion.parsers import (
+    parse_boxscore_batting,
+    parse_boxscore_pitching,
+    parse_schedule,
+)
 
 # Cap the anomaly/missing lists carried in the JSON summary; totals are
 # always exact, the lists are just the first examples for a human eye.
@@ -117,7 +133,23 @@ def run(
         "parse_anomalies_total": 0,
         "parse_anomalies": [],
         "null_fly_outs": 0,
+        "batting_lines_upserted": 0,
+        "batting_zero_pa_skipped": 0,
+        "batting_anomalies_total": 0,
+        "batting_anomalies": [],
     }
+
+    # Batting is reflected separately (migration 004): pre-004 the batting
+    # half degrades to a note while pitching ingestion continues untouched.
+    batting_enabled = True
+    try:
+        tables.update(store.reflect_tables(engine, (store.BATTING_TABLE,)))
+    except InvalidRequestError:
+        batting_enabled = False
+        summary["batting_note"] = (
+            "batting_game_logs missing; apply migration 004 "
+            "(batting lines skipped this run)"
+        )
 
     events_t = tables["events"]
     logs_t = tables["pitching_game_logs"]
@@ -159,16 +191,32 @@ def run(
             ).all()
             event_by_pk = {int(r.pk): r for r in rows}
             have_logs: set = set()
+            have_batting: set = set()
             if event_by_pk and not force:
+                event_ids = [r.id for r in event_by_pk.values()]
                 have_logs = {
                     r.event_id
                     for r in conn.execute(
                         select(logs_t.c.event_id)
-                        .where(logs_t.c.event_id.in_([r.id for r in event_by_pk.values()]))
+                        .where(logs_t.c.event_id.in_(event_ids))
                         .distinct()
                     )
                 }
+                if batting_enabled:
+                    bat_t = tables["batting_game_logs"]
+                    have_batting = {
+                        r.event_id
+                        for r in conn.execute(
+                            select(bat_t.c.event_id)
+                            .where(bat_t.c.event_id.in_(event_ids))
+                            .distinct()
+                        )
+                    }
 
+        # An event is pending if EITHER half is missing; the single fetch
+        # then feeds only the missing half (that is what makes the
+        # historical batting fill cheap over events that already have
+        # pitching). Without migration 004 the batting half never counts.
         pending = []
         for game in games:
             event = event_by_pk.get(game.game_pk)
@@ -178,48 +226,74 @@ def run(
                 summary["missing_events_total"] += 1
                 _capped_append(summary, "missing_events", str(game.game_pk))
                 continue
-            if event.id in have_logs:
+            need_pitch = event.id not in have_logs
+            need_bat = batting_enabled and event.id not in have_batting
+            if not need_pitch and not need_bat:
                 summary["events_skipped_existing"] += 1
                 continue
-            pending.append((game, event))
+            pending.append((game, event, need_pitch, need_bat))
 
-        chunk_lines: list[tuple[Any, list]] = []  # (event row, lines)
+        chunk_lines: list[tuple[Any, list]] = []  # (event row, pitching lines)
+        chunk_bat_lines: list[tuple[Any, list]] = []  # (event row, batting lines)
         player_entries: dict[int, dict] = {}
-        for game, event in pending:
-            box = parse_boxscore_pitching(client.get_boxscore(game.game_pk))
+        pitcher_ids: set[int] = set()
+        for game, event, need_pitch, need_bat in pending:
+            payload = client.get_boxscore(game.game_pk)
             summary["boxscores_fetched"] += 1
-            for anomaly in box.anomalies:
-                summary["parse_anomalies_total"] += 1
-                _capped_append(summary, "parse_anomalies", f"{game.game_pk}:{anomaly}")
-            for side_is_home in (True, False):
-                side_lines = [l for l in box.lines if l.is_home is side_is_home]
-                if side_lines and not any(l.is_starter for l in side_lines):
-                    summary["starter_anomalies_total"] += 1
-                    _capped_append(
-                        summary,
-                        "starter_anomalies",
-                        f"{game.game_pk}:{'home' if side_is_home else 'away'}",
-                    )
-            summary["null_fly_outs"] += sum(1 for l in box.lines if l.fly_outs is None)
-            for line in box.lines:
-                held = player_entries.get(line.mlb_person_id)
-                if held is None or (held["pitch_hand"] is None and line.pitch_hand):
-                    player_entries[line.mlb_person_id] = {
-                        "mlb_person_id": line.mlb_person_id,
-                        "full_name": line.full_name,
-                        "pitch_hand": line.pitch_hand,
-                    }
-            if box.lines:
-                chunk_lines.append((event, list(box.lines)))
+            if need_pitch:
+                box = parse_boxscore_pitching(payload)
+                for anomaly in box.anomalies:
+                    summary["parse_anomalies_total"] += 1
+                    _capped_append(summary, "parse_anomalies", f"{game.game_pk}:{anomaly}")
+                for side_is_home in (True, False):
+                    side_lines = [l for l in box.lines if l.is_home is side_is_home]
+                    if side_lines and not any(l.is_starter for l in side_lines):
+                        summary["starter_anomalies_total"] += 1
+                        _capped_append(
+                            summary,
+                            "starter_anomalies",
+                            f"{game.game_pk}:{'home' if side_is_home else 'away'}",
+                        )
+                summary["null_fly_outs"] += sum(1 for l in box.lines if l.fly_outs is None)
+                for line in box.lines:
+                    pitcher_ids.add(line.mlb_person_id)
+                    held = player_entries.get(line.mlb_person_id)
+                    if held is None or (held["pitch_hand"] is None and line.pitch_hand):
+                        player_entries[line.mlb_person_id] = {
+                            "mlb_person_id": line.mlb_person_id,
+                            "full_name": line.full_name,
+                            "pitch_hand": line.pitch_hand,
+                        }
+                if box.lines:
+                    chunk_lines.append((event, list(box.lines)))
+            if need_bat:
+                bat = parse_boxscore_batting(payload)
+                for anomaly in bat.anomalies:
+                    summary["batting_anomalies_total"] += 1
+                    _capped_append(summary, "batting_anomalies", f"{game.game_pk}:{anomaly}")
+                summary["batting_zero_pa_skipped"] += bat.zero_pa_skipped
+                for line in bat.lines:
+                    # Batters never clobber a pitcher entry (two-way players
+                    # keep their hand) and never enter the /people lookups.
+                    if line.mlb_person_id not in player_entries:
+                        player_entries[line.mlb_person_id] = {
+                            "mlb_person_id": line.mlb_person_id,
+                            "full_name": line.full_name,
+                            "pitch_hand": None,
+                        }
+                if bat.lines:
+                    chunk_bat_lines.append((event, list(bat.lines)))
             if sleep_seconds > 0:
                 time.sleep(sleep_seconds)
 
         # Boxscores omit pitch hands; resolve the still-unknown ones in
-        # batched people lookups so features can use sp_is_lhp.
+        # batched people lookups so features can use sp_is_lhp. ONLY for
+        # players who pitched: position players would multiply the lookups
+        # by ~15x for a field no batting feature reads.
         need_hands = [
             pid
             for pid, e in sorted(player_entries.items())
-            if e["pitch_hand"] is None and pid not in known_hands
+            if e["pitch_hand"] is None and pid in pitcher_ids and pid not in known_hands
         ]
         if need_hands:
             for pid, hand in _resolve_hands(client, need_hands).items():
@@ -229,17 +303,25 @@ def run(
                     player_entries[pid]["pitch_hand"] = hand
                     summary["hands_backfilled"] += 1
 
-        if chunk_lines:
+        if chunk_lines or chunk_bat_lines:
             with engine.begin() as conn:
                 if force:
                     # A corrected boxscore can REMOVE a line (wrongly credited
-                    # pitcher); upserts alone never converge on that, so a
-                    # forced re-fetch replaces each game's rows wholesale.
-                    conn.execute(
-                        logs_t.delete().where(
-                            logs_t.c.event_id.in_([e.id for e, _ in chunk_lines])
+                    # pitcher/batter); upserts alone never converge on that,
+                    # so a forced re-fetch replaces each game's rows wholesale.
+                    if chunk_lines:
+                        conn.execute(
+                            logs_t.delete().where(
+                                logs_t.c.event_id.in_([e.id for e, _ in chunk_lines])
+                            )
                         )
-                    )
+                    if chunk_bat_lines:
+                        bat_t = tables["batting_game_logs"]
+                        conn.execute(
+                            bat_t.delete().where(
+                                bat_t.c.event_id.in_([e.id for e, _ in chunk_bat_lines])
+                            )
+                        )
                 store.bulk_upsert_players(
                     conn, tables, store.get_sport_id(conn, tables),
                     list(player_entries.values()), player_cache,
@@ -250,6 +332,11 @@ def run(
                         known_hands.add(pid)
                 for event, lines in chunk_lines:
                     summary["lines_upserted"] += store.bulk_upsert_pitching_logs(
+                        conn, tables, event.id, event.home_team_id,
+                        event.away_team_id, lines, player_cache,
+                    )
+                for event, lines in chunk_bat_lines:
+                    summary["batting_lines_upserted"] += store.bulk_upsert_batting_logs(
                         conn, tables, event.id, event.home_team_id,
                         event.away_team_id, lines, player_cache,
                     )

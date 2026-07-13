@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from app.ingestion.parsers import (
     OddsEvent,
+    parse_boxscore_batting,
     parse_boxscore_pitching,
     parse_odds_event,
     parse_schedule,
@@ -202,3 +203,65 @@ class TestParseBoxscorePitching:
         # No pitching data at all is not silently OK.
         assert "home:starter_count:0" in box.anomalies
         assert "away:starter_count:0" in box.anomalies
+
+
+class TestParseBoxscoreBatting:
+    def _parsed(self):
+        return parse_boxscore_batting(load_fixture("mlb_boxscore.json"))
+
+    def test_kept_dropped_and_skipped(self):
+        box = self._parsed()
+        # Kept: catcher + DH (home), leadoff (away). The broken batter is
+        # dropped (missing atBats), the pinch runner has zero derived PA,
+        # and pitchers with empty batting blocks never count.
+        assert {l.mlb_person_id for l in box.lines} == {700010, 700011, 700021}
+        assert box.anomalies == ("away:700020:batting_missing:atBats",)
+        assert box.zero_pa_skipped == 1
+
+    def test_full_line_values_and_sides(self):
+        box = self._parsed()
+        catcher = next(l for l in box.lines if l.mlb_person_id == 700010)
+        assert catcher.is_home is True
+        assert (catcher.at_bats, catcher.hits, catcher.doubles, catcher.triples,
+                catcher.home_runs) == (4, 2, 1, 0, 1)
+        assert (catcher.walks, catcher.intentional_walks, catcher.strikeouts,
+                catcher.hit_by_pitch) == (1, 0, 1, 0)
+        assert catcher.batting_order == 200
+        assert catcher.plate_appearances == 5
+        leadoff = next(l for l in box.lines if l.mlb_person_id == 700021)
+        assert leadoff.is_home is False
+        assert (leadoff.hit_by_pitch, leadoff.sac_flies, leadoff.sac_bunts) == (1, 1, 0)
+
+    def test_omitted_counting_stats_are_true_zeros(self):
+        # The DH's payload omits triples/IBB/HBP/SF/SH: in this feed an
+        # omitted counting event means it did not happen.
+        dh = next(l for l in self._parsed().lines if l.mlb_person_id == 700011)
+        assert (dh.triples, dh.intentional_walks, dh.hit_by_pitch,
+                dh.sac_flies, dh.sac_bunts) == (0, 0, 0, 0, 0)
+
+    def test_inconsistent_line_dropped_and_side_without_kept_lines_is_loud(self):
+        payload = load_fixture("mlb_boxscore.json")
+        away = payload["teams"]["away"]["players"]
+        away["ID700021"]["stats"]["batting"]["hits"] = 6  # > atBats 5
+        box = parse_boxscore_batting(payload)
+        assert all(not l.mlb_person_id == 700021 for l in box.lines)
+        assert "away:700021:batting_inconsistent" in box.anomalies
+        # Both away batters are now gone: exactly what a field-name drift
+        # would look like — it must be loud.
+        assert "away:no_batting_lines_kept" in box.anomalies
+
+    def test_junk_batting_order_becomes_none(self):
+        payload = load_fixture("mlb_boxscore.json")
+        home = payload["teams"]["home"]["players"]
+        home["ID700010"]["battingOrder"] = "0"
+        del home["ID700011"]["battingOrder"]
+        box = parse_boxscore_batting(payload)
+        by_id = {l.mlb_person_id: l for l in box.lines}
+        assert by_id[700010].batting_order is None
+        assert by_id[700011].batting_order is None
+
+    def test_empty_payload_has_no_lines_and_no_anomalies(self):
+        # No batting sections at all (e.g. a malformed feed) yields nothing;
+        # the JOB flags it via the per-side counters when lines were expected.
+        box = parse_boxscore_batting({"teams": {"home": {}, "away": {}}})
+        assert box.lines == () and box.zero_pa_skipped == 0
