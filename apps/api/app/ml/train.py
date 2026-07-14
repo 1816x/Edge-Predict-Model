@@ -28,6 +28,8 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 from app.ml.dataset import FEATURE_COLUMNS
 
@@ -168,6 +170,15 @@ def walk_forward_report(
 
         models = {
             "logistic": LogisticRegression(max_iter=2000, C=1.0),
+            # docs/04 §2.2 mandates standardized features for the logistic;
+            # the Pipeline fits the scaler on THIS fold's train only (never
+            # the full dataset — that would leak future means/variances).
+            # The unscaled twin stays for ONE more tanda as the attribution
+            # witness vs the pre-offense baseline (run #37); drop it once
+            # the F1.2 measurement is recorded in PLAN.md.
+            "logistic_scaled": make_pipeline(
+                StandardScaler(), LogisticRegression(max_iter=2000, C=1.0)
+            ),
             "hist_gb": HistGradientBoostingClassifier(
                 max_depth=3, learning_rate=0.05, max_iter=300,
                 l2_regularization=1.0, random_state=7,

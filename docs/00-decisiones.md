@@ -46,6 +46,44 @@ posterior a estas decisiones debe registrarse aquí con fecha y razón.
   varían por jurisdicción, no solo por idioma, y se resuelven en la revisión legal de F3
   junto con la decisión #5. Los docs internos y la operación siguen en español.
 
+## Addenda (2026-07-13, tanda F1.2 — bloque de ofensiva)
+
+Concreciones de implementación de `docs/04 §1.2` decididas en esta tanda (el doc es la
+especificación; esto registra cómo se aterrizó y por qué):
+
+- **Bateo por jugador-juego** (`batting_game_logs`, migración 004), no agregado por equipo:
+  el fetch del boxscore ya se paga y las filas por bateador desbloquean el bloque de lineup
+  (§1.5) sin re-ingerir ~19K boxscores — la misma filosofía de la 003 con los relevistas.
+  Se excluyen líneas con PA derivada cero (corredores emergentes/defensas: nada que aportar
+  a features de tasas). `batting_order` y `plate_appearances` se archivan como auditoría.
+- **Constantes wOBA fijas de FanGraphs 2017** (wBB .693, wHBP .723, w1B .877, w2B 1.232,
+  w3B 1.552, wHR 1.980): son ANTERIORES a todo el dataset (2018+), así que cumplen el
+  checklist §4.9 (nunca constantes de fin de temporada en curso) por construcción, para
+  toda fila y sin maquinaria as-of. A una feature solo le importan orden y estabilidad,
+  no la escala absoluta — el mismo argumento con el que el bloque abridor omite la
+  constante aditiva del xFIP.
+- **Denominadores derivados de componentes**: PA = AB+BB+HBP+SF+SH para K%/BB%; denominador
+  wOBA = AB+BB−IBB+SF+HBP. Nunca el campo `plateAppearances` del feed (uniformidad entre
+  eras; interferencia del catcher excluida uniformemente).
+- **Ventanas por día UTC terminando AYER** (30d = días [D−30, D−1]; season = año UTC de D
+  hasta D−1): la regla intradía-segura de §1.1, igual que el bloque bullpen de F1.1.
+- **Split vs mano = proxy por abridor rival**: sin play-by-play no hay splits por PA; el
+  clasificador del pasado es la mano del abridor REAL que el equipo enfrentó (join a
+  `pitching_game_logs.is_starter`). Se emite UNA feature seleccionada por la mano del
+  rival del juego a predecir (`team_woba_vs_opp_hand_30d`, como la nombra §2.2): probable
+  as-of en online, abridor real en bulk (la convención documentada del bloque abridor).
+- **Shrinkage del split hacia la ventana móvil de 365 días del propio equipo** con
+  pseudo-muestra de 200 PA: implementa "hacia split de temporada, y en abril hacia
+  temporada previa ponderada" con UN mecanismo continuo (en abril la ventana de 365d ES
+  mayormente la temporada previa), espejo de las ventanas del bloque abridor. Las demás
+  tasas van crudas (§1.2 solo obliga shrinkage en splits); ventana vacía → None, jamás
+  ceros fabricados.
+- **El bloque entra a ML y a F5** (54/46 columnas): la única exclusión por diseño de F5
+  sigue siendo el bullpen (§1.4). El refinamiento F5 hacia lineup (§1.9) llegará con §1.5.
+- **Fórmulas en un módulo compartido** (`app/features/offense.py`) importado por builder y
+  dataset: elimina la clase de skew de fórmula duplicada; la paridad de ventanas sigue
+  guardada por el test online/bulk.
+
 ## Principios no negociables (del brief original)
 
 - No se promete rentabilidad. El producto vende claridad, control de riesgo y trazabilidad.

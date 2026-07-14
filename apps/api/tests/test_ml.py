@@ -93,6 +93,7 @@ class TestWalkForward:
             # constant-0.5 baseline on log loss.
             assert rep["hist_gb"]["calibrated"]["log_loss"] < rep["baseline_constant"]["log_loss"]
             assert rep["logistic"]["calibrated"]["log_loss"] < rep["baseline_constant"]["log_loss"]
+            assert rep["logistic_scaled"]["calibrated"]["log_loss"] < rep["baseline_constant"]["log_loss"]
 
     def test_f5_market_drops_pushes(self):
         games = _synthetic_games(n_seasons=2, per_season=60)
@@ -427,7 +428,9 @@ class TestMarketPriorSubset:
         assert sub["gate"]["evaluated"] is True
         # Against a coin-flip prior the learned models must win (same claim
         # the baseline_constant assertion makes on the full season).
-        assert sub["gate"]["beaten_by"] == {"logistic": True, "hist_gb": True}
+        assert sub["gate"]["beaten_by"] == {
+            "logistic": True, "logistic_scaled": True, "hist_gb": True,
+        }
 
         import json
 
@@ -495,6 +498,11 @@ def test_train_f1_job_reports_sp_coverage(seeded):
     # Reliever archive comes alive after June 5th: 4 of 5 games covered.
     assert block["bullpen_coverage"] == 0.8
     assert "bullpen_coverage" not in result["markets"]["f5_moneyline"]
+    # Offense: e900001/e900002/e900004 have both teams with a real 30d
+    # batting window; e900003 predates the archive and e900005's home team
+    # (A) never bats in the seeds.
+    assert block["offense_coverage"] == 0.6
+    assert "batting_note" not in result
     # Not enough seasons to test anything: the report stays honest and empty.
     assert block["report"]["seasons"] == {}
 
