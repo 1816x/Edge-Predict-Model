@@ -23,6 +23,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection, Engine
 
 from app.ingestion.parsers import (
+    BattingLine,
     GameResult,
     OddsEvent,
     OddsOutcome,
@@ -50,6 +51,11 @@ PITCHING_TABLES = (
     "pitching_game_logs",
     "event_probables",
 )
+
+# Migration 004 table, reflected separately for the same degradation
+# contract: pre-004 the boxscore job keeps ingesting pitching and only
+# skips the batting half (with a note), never the whole run.
+BATTING_TABLE = "batting_game_logs"
 
 EVENT_MATCH_WINDOW = timedelta(hours=3)
 
@@ -533,6 +539,59 @@ def bulk_upsert_pitching_logs(
                 "batters_faced", "strikeouts", "walks", "hit_batsmen",
                 "home_runs", "fly_outs", "ground_outs", "sac_flies",
                 "pitches_thrown", "source",
+            )
+        },
+    )
+    conn.execute(stmt)
+    return len(rows)
+
+
+def bulk_upsert_batting_logs(
+    conn: Connection,
+    t: dict[str, Table],
+    event_id: uuid.UUID,
+    home_team_id: uuid.UUID,
+    away_team_id: uuid.UUID,
+    lines: list[BattingLine],
+    player_cache: dict[int, uuid.UUID],
+) -> int:
+    """Upsert one game's batting lines (DO UPDATE: MLB corrects boxscores)."""
+    if not lines:
+        return 0
+    logs = t["batting_game_logs"]
+    rows = [
+        {
+            "event_id": event_id,
+            "player_id": player_cache[line.mlb_person_id],
+            "team_id": home_team_id if line.is_home else away_team_id,
+            "is_home": line.is_home,
+            "at_bats": line.at_bats,
+            "hits": line.hits,
+            "doubles": line.doubles,
+            "triples": line.triples,
+            "home_runs": line.home_runs,
+            "walks": line.walks,
+            "intentional_walks": line.intentional_walks,
+            "strikeouts": line.strikeouts,
+            "hit_by_pitch": line.hit_by_pitch,
+            "sac_flies": line.sac_flies,
+            "sac_bunts": line.sac_bunts,
+            "batting_order": line.batting_order,
+            "plate_appearances": line.plate_appearances,
+            "source": "mlb_stats_api",
+        }
+        for line in lines
+    ]
+    stmt = pg_insert(logs).values(rows)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["event_id", "player_id"],
+        set_={
+            col: getattr(stmt.excluded, col)
+            for col in (
+                "team_id", "is_home", "at_bats", "hits", "doubles", "triples",
+                "home_runs", "walks", "intentional_walks", "strikeouts",
+                "hit_by_pitch", "sac_flies", "sac_bunts", "batting_order",
+                "plate_appearances", "source",
             )
         },
     )

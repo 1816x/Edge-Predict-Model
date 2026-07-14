@@ -161,7 +161,7 @@ CREATE TABLE event_results (
 );
 
 -- ============================================================================
--- Players, pitching game logs and probables (F1 starter block)
+-- Players, game logs (pitching + batting) and probables (F1 blocks)
 -- ============================================================================
 
 -- Generic player dimension (not just pitchers: the lineup block reuses it).
@@ -203,6 +203,42 @@ CREATE TABLE pitching_game_logs (
     created_at     timestamptz NOT NULL DEFAULT now(),
     updated_at     timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (event_id, player_id)
+);
+
+-- One row per batter per game with a nonzero derived plate appearance
+-- count (pinch runners / defensive subs contribute nothing to rate
+-- features and are excluded by the parser). Required counting columns are
+-- parser-guaranteed; events the feed omits when zero (doubles, triples,
+-- home runs, IBB, HBP, SF, SH) arrive as true zeros. plate_appearances
+-- and batting_order are NULLable audit fields, never denominators (the
+-- feature layer derives PA from components for cross-era uniformity).
+-- Internal-consistency CHECKs stop corrupted boxscores at the door.
+-- NOT append-only: MLB corrects boxscores, upserts are DO UPDATE.
+CREATE TABLE batting_game_logs (
+    event_id          uuid NOT NULL REFERENCES events (id),
+    player_id         uuid NOT NULL REFERENCES players (id),
+    team_id           uuid NOT NULL REFERENCES teams (id),
+    is_home           boolean NOT NULL,
+    at_bats           integer NOT NULL CHECK (at_bats >= 0),
+    hits              integer NOT NULL CHECK (hits >= 0),
+    doubles           integer NOT NULL CHECK (doubles >= 0),
+    triples           integer NOT NULL CHECK (triples >= 0),
+    home_runs         integer NOT NULL CHECK (home_runs >= 0),
+    walks             integer NOT NULL CHECK (walks >= 0),
+    intentional_walks integer NOT NULL CHECK (intentional_walks >= 0),
+    strikeouts        integer NOT NULL CHECK (strikeouts >= 0),
+    hit_by_pitch      integer NOT NULL CHECK (hit_by_pitch >= 0),
+    sac_flies         integer NOT NULL CHECK (sac_flies >= 0),
+    sac_bunts         integer NOT NULL CHECK (sac_bunts >= 0),
+    batting_order     integer CHECK (batting_order >= 100),
+    plate_appearances integer CHECK (plate_appearances >= 0),
+    source            text,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    updated_at        timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (event_id, player_id),
+    CHECK (hits <= at_bats),
+    CHECK (doubles + triples + home_runs <= hits),
+    CHECK (intentional_walks <= walks)
 );
 
 -- Probable starters as an append-per-change history: a row is inserted
@@ -428,6 +464,11 @@ CREATE INDEX idx_pitching_logs_player ON pitching_game_logs (player_id);
 CREATE INDEX idx_event_probables_event
     ON event_probables (event_id, side, first_seen_at DESC);
 
+-- Batting history per player (lineup block, §1.5) and per team (offense
+-- block windows, §1.2 — the online builder queries by team_id directly).
+CREATE INDEX idx_batting_logs_player ON batting_game_logs (player_id);
+CREATE INDEX idx_batting_logs_team ON batting_game_logs (team_id);
+
 -- Aggregated performance (monthly yield, CLV beat-rate).
 CREATE INDEX idx_pick_results_settled_at ON pick_results (settled_at);
 CREATE INDEX idx_daily_scans_date ON daily_scans (scan_date DESC);
@@ -478,6 +519,10 @@ CREATE TRIGGER trg_players_updated_at
 
 CREATE TRIGGER trg_pitching_game_logs_updated_at
     BEFORE UPDATE ON pitching_game_logs
+    FOR EACH ROW EXECUTE FUNCTION edge_set_updated_at();
+
+CREATE TRIGGER trg_batting_game_logs_updated_at
+    BEFORE UPDATE ON batting_game_logs
     FOR EACH ROW EXECUTE FUNCTION edge_set_updated_at();
 
 -- ============================================================================

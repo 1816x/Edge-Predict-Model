@@ -30,6 +30,7 @@ from app.db.engine import make_engine
 from app.ml.dataset import (
     build_training_frame,
     feature_columns,
+    load_batting_frame,
     load_bullpen_frame,
     load_market_prior,
     load_pitching_frame,
@@ -52,6 +53,12 @@ def _bullpen_coverage(frame) -> float:
     both = (
         frame["home_bullpen_ip_l3d"].notna() & frame["away_bullpen_ip_l3d"].notna()
     )
+    return round(float(both.mean()), 4) if len(frame) else 0.0
+
+
+def _offense_coverage(frame) -> float:
+    """Share of rows where BOTH teams carry a real 30d offense window."""
+    both = frame["home_team_woba_30d"].notna() & frame["away_team_woba_30d"].notna()
     return round(float(both.mean()), 4) if len(frame) else 0.0
 
 
@@ -108,8 +115,26 @@ def run(
             "backfill_pitching (sp_*/bullpen_* features are all NaN this run)"
         )
 
+    # Batting has its own try (migration 004 is newer than 003): a database
+    # in the 003-but-not-004 state must still train with real sp/bullpen
+    # features and only degrade the offense block.
+    batting = None
+    try:
+        batting = load_batting_frame(engine)
+        if len(batting) == 0:
+            batting = None
+            out["batting_note"] = (
+                "batting_game_logs is empty; run backfill_pitching "
+                "(team offense features are all NaN this run)"
+            )
+    except (ProgrammingError, DatabaseError):
+        out["batting_note"] = (
+            "batting_game_logs missing; apply migration 004 and run "
+            "backfill_pitching (team offense features are all NaN this run)"
+        )
+
     for market in markets:
-        frame = build_training_frame(games, market, pitching, bullpen)
+        frame = build_training_frame(games, market, pitching, bullpen, batting)
         prior = load_market_prior(engine, market)
         frame = frame.merge(prior, on="event_id", how="left")
         block = {
@@ -119,6 +144,8 @@ def run(
             # backfill this should exceed ~0.95; lower means holes in the
             # pitching archive worth investigating before quoting metrics.
             "sp_coverage": _sp_coverage(frame),
+            # Same idea for the offense block (both markets carry it).
+            "offense_coverage": _offense_coverage(frame),
             "rows_with_market_prior": int(frame["market_prior_p_home"].notna().sum()),
             "report": walk_forward_report(
                 frame, min_train_seasons, feature_columns(market)
@@ -132,14 +159,15 @@ def run(
 
 def _markdown_summary(result: dict[str, Any]) -> str:
     lines = ["", "## Resumen F1 (walk-forward, calibrado con Platt)", ""]
-    if "pitching_note" in result:
-        lines.append(f"> ⚠ {result['pitching_note']}")
-        lines.append("")
-    if "bullpen_note" in result:
-        lines.append(f"> ⚠ {result['bullpen_note']}")
-        lines.append("")
+    for note_key in ("pitching_note", "bullpen_note", "batting_note"):
+        if note_key in result:
+            lines.append(f"> ⚠ {result[note_key]}")
+            lines.append("")
     for market, block in result.get("markets", {}).items():
-        coverage = f"sp_coverage {block['sp_coverage']}"
+        coverage = (
+            f"sp_coverage {block['sp_coverage']}, "
+            f"offense_coverage {block['offense_coverage']}"
+        )
         if "bullpen_coverage" in block:
             coverage += f", bullpen_coverage {block['bullpen_coverage']}"
         lines.append(
@@ -147,16 +175,17 @@ def _markdown_summary(result: dict[str, Any]) -> str:
             f"{coverage}"
         )
         lines.append("")
-        lines.append("| Test | n | const LL | home_rate LL | logistic LL | hist_gb LL | logistic ECE | hist_gb ECE |")
-        lines.append("|---|---|---|---|---|---|---|---|")
+        lines.append("| Test | n | const LL | home_rate LL | logistic LL | log_scaled LL | hist_gb LL | log_scaled ECE | hist_gb ECE |")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
         for season, rep in sorted(block["report"]["seasons"].items()):
             lines.append(
                 f"| {season} | {rep['logistic']['calibrated']['n']} "
                 f"| {rep['baseline_constant']['log_loss']} "
                 f"| {rep['baseline_home_rate']['log_loss']} "
                 f"| {rep['logistic']['calibrated']['log_loss']} "
+                f"| {rep['logistic_scaled']['calibrated']['log_loss']} "
                 f"| {rep['hist_gb']['calibrated']['log_loss']} "
-                f"| {rep['logistic']['calibrated']['ece']} "
+                f"| {rep['logistic_scaled']['calibrated']['ece']} "
                 f"| {rep['hist_gb']['calibrated']['ece']} |"
             )
         lines.append("")
@@ -170,8 +199,8 @@ def _markdown_summary(result: dict[str, Any]) -> str:
                 "Subconjunto con market prior archivado (mismas filas para prior y modelos):"
             )
             lines.append("")
-            lines.append("| Test | n_prior | prior LL | logistic LL | hist_gb LL | gate |")
-            lines.append("|---|---|---|---|---|---|")
+            lines.append("| Test | n_prior | prior LL | logistic LL | log_scaled LL | hist_gb LL | gate |")
+            lines.append("|---|---|---|---|---|---|---|")
             for season, sub in prior_rows:
                 gate = sub.get("gate", {})
                 verdict = (
@@ -183,6 +212,7 @@ def _markdown_summary(result: dict[str, Any]) -> str:
                     f"| {season} | {sub['n']} "
                     f"| {sub['market_prior']['log_loss']} "
                     f"| {sub['logistic_calibrated']['log_loss']} "
+                    f"| {sub['logistic_scaled_calibrated']['log_loss']} "
                     f"| {sub['hist_gb_calibrated']['log_loss']} "
                     f"| {verdict} |"
                 )

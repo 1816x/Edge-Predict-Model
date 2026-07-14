@@ -47,8 +47,54 @@
         "ID700010": {
           "person": {"id": 700010, "fullName": "Everyday Catcher"},
           "position": {"code": "2", "abbreviation": "C"},
+          "battingOrder": "200",
           "stats": {
-            "batting": {"hits": 2, "atBats": 4},
+            "batting": {
+              "atBats": 4,
+              "hits": 2,
+              "doubles": 1,
+              "triples": 0,
+              "homeRuns": 1,
+              "baseOnBalls": 1,
+              "intentionalWalks": 0,
+              "strikeOuts": 1,
+              "hitByPitch": 0,
+              "sacFlies": 0,
+              "sacBunts": 0,
+              "plateAppearances": 5
+            },
+            "pitching": {}
+          }
+        },
+        "ID700011": {
+          "person": {"id": 700011, "fullName": "Slugging DH"},
+          "position": {"code": "10", "abbreviation": "DH"},
+          "battingOrder": "100",
+          "stats": {
+            "batting": {
+              "atBats": 3,
+              "hits": 1,
+              "doubles": 0,
+              "homeRuns": 1,
+              "baseOnBalls": 2,
+              "strikeOuts": 0,
+              "plateAppearances": 5
+            },
+            "pitching": {}
+          }
+        },
+        "ID700012": {
+          "person": {"id": 700012, "fullName": "Pinch Runner"},
+          "position": {"code": "8", "abbreviation": "CF"},
+          "battingOrder": "901",
+          "stats": {
+            "batting": {
+              "atBats": 0,
+              "hits": 0,
+              "baseOnBalls": 0,
+              "strikeOuts": 0,
+              "plateAppearances": 0
+            },
             "pitching": {}
           }
         }
@@ -61,8 +107,15 @@
         "ID700002": {
           "person": {"id": 700002, "fullName": "Old Data Lefty"},
           "position": {"code": "1", "abbreviation": "P"},
+          "battingOrder": "900",
           "stats": {
-            "batting": {},
+            "batting": {
+              "atBats": 2,
+              "hits": 0,
+              "baseOnBalls": 0,
+              "strikeOuts": 2,
+              "plateAppearances": 2
+            },
             "pitching": {
               "inningsPitched": "5.2",
               "battersFaced": 23,
@@ -82,6 +135,37 @@
               "strikeOuts": 2,
               "baseOnBalls": 1
             }
+          }
+        },
+        "ID700020": {
+          "person": {"id": 700020, "fullName": "Broken Batter"},
+          "position": {"code": "6", "abbreviation": "SS"},
+          "battingOrder": "600",
+          "stats": {
+            "batting": {"hits": 1, "strikeOuts": 1, "baseOnBalls": 0},
+            "pitching": {}
+          }
+        },
+        "ID700021": {
+          "person": {"id": 700021, "fullName": "Leadoff Nine"},
+          "position": {"code": "4", "abbreviation": "2B"},
+          "battingOrder": "100",
+          "stats": {
+            "batting": {
+              "atBats": 5,
+              "hits": 2,
+              "doubles": 2,
+              "triples": 0,
+              "homeRuns": 0,
+              "baseOnBalls": 0,
+              "intentionalWalks": 0,
+              "strikeOuts": 2,
+              "hitByPitch": 1,
+              "sacFlies": 1,
+              "sacBunts": 0,
+              "plateAppearances": 7
+            },
+            "pitching": {}
           }
         }
       }

@@ -63,11 +63,12 @@ def seeded(db):
     from sqlalchemy import text
 
     from app.ingestion import store
-    from app.ingestion.parsers import GameResult, PitchingLine, ScheduledGame
+    from app.ingestion.parsers import BattingLine, GameResult, PitchingLine, ScheduledGame
 
     H, A, X = "Boston Red Sox", "New York Yankees", "Tampa Bay Rays"
     SP1, SP2 = 500001, 500002  # X's righty ace, H's lefty
     R1, R2, R3 = 700101, 700102, 700103  # relievers: X, H, X
+    HB1, HB2, XB1 = 800001, 800002, 800011  # batters: H, H, X
 
     def _game(pk, start, home, away, status="final"):
         return ScheduledGame(
@@ -93,11 +94,21 @@ def seeded(db):
             pitches_thrown=pitches,
         )
 
+    def _bat(pid, is_home, ab, h, d2, d3, hr, bb, ibb, so, hbp, sf, sh):
+        return BattingLine(
+            mlb_person_id=pid, full_name=f"B{pid}", is_home=is_home,
+            at_bats=ab, hits=h, doubles=d2, triples=d3, home_runs=hr,
+            walks=bb, intentional_walks=ibb, strikeouts=so, hit_by_pitch=hbp,
+            sac_flies=sf, sac_bunts=sh, batting_order=None,
+            plate_appearances=None,
+        )
+
     tables = store.reflect_tables(
         db,
         (
             "sports", "teams", "events", "event_results", "feature_snapshots",
             "players", "pitching_game_logs", "event_probables",
+            "batting_game_logs",
         ),
     )
     ts = lambda m, d, h: datetime(2026, m, d, h, 0, tzinfo=timezone.utc)  # noqa: E731
@@ -116,8 +127,8 @@ def seeded(db):
         e900003 = _seed(conn, tables, sport_id, 900003, ts(6, 5, 23), H, X,
                         GameResult(900003, 1, 0, 0, 0))
         # ...and one AFTER as_of (starts 07-09T00:00Z): must never leak in.
-        _seed(conn, tables, sport_id, 900004, ts(7, 9, 0), H, X,
-              GameResult(900004, 10, 0, 8, 0))
+        e900004 = _seed(conn, tables, sport_id, 900004, ts(7, 9, 0), H, X,
+                        GameResult(900004, 10, 0, 8, 0))
         # A history: single loss on July 4th.
         e900005 = _seed(conn, tables, sport_id, 900005, ts(7, 4, 23), A, X,
                         GameResult(900005, 2, 6, 1, 2))
@@ -193,5 +204,53 @@ def seeded(db):
                 {"event_id": e900002, "side": "away",
                  "player_id": player_cache[SP2], "first_seen_at": ts(7, 6, 12)},
             ],
+        )
+        # --- Offense seeds (docs/04 §1.2). Hand-computed in the tests; the
+        # opposing-starter hands per game follow from the pitching seeds:
+        # H bats vs NULL hand in e900001 (X archived no starter there) and
+        # vs SP1 (R) in e900003/e900002; X bats vs SP2 (L) in e900001 and
+        # e900002 and vs NULL in e900005. Same-day lines on e900002 double
+        # as exclusion markers for that target; e900004 (Jul 9) is the
+        # future leak marker. A never bats: its offense block must be None.
+        store.bulk_upsert_players(
+            conn, tables, sport_id,
+            [
+                {"mlb_person_id": HB1, "full_name": "Grinder One", "pitch_hand": None},
+                {"mlb_person_id": HB2, "full_name": "Grinder Two", "pitch_hand": None},
+                {"mlb_person_id": XB1, "full_name": "Rays Bat", "pitch_hand": None},
+            ],
+            player_cache,
+        )
+        store.bulk_upsert_batting_logs(
+            conn, tables, e900003, teams[H], teams[X],
+            [
+                _bat(HB1, True, 4, 2, 1, 0, 1, 0, 0, 1, 0, 0, 0),
+                _bat(HB2, True, 3, 0, 0, 0, 0, 1, 1, 2, 0, 1, 0),
+            ],
+            player_cache,
+        )
+        store.bulk_upsert_batting_logs(
+            conn, tables, e900005, teams[A], teams[X],
+            [_bat(XB1, False, 3, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0)], player_cache,
+        )
+        store.bulk_upsert_batting_logs(
+            conn, tables, e900001, teams[H], teams[X],
+            [
+                _bat(HB1, True, 6, 3, 1, 1, 0, 2, 0, 2, 1, 0, 1),
+                _bat(XB1, False, 4, 1, 0, 0, 0, 1, 0, 2, 0, 0, 0),
+            ],
+            player_cache,
+        )
+        store.bulk_upsert_batting_logs(
+            conn, tables, e900002, teams[X], teams[H],
+            [
+                _bat(XB1, True, 4, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0),
+                _bat(HB2, False, 4, 2, 2, 0, 0, 1, 0, 1, 0, 0, 0),
+            ],
+            player_cache,
+        )
+        store.bulk_upsert_batting_logs(
+            conn, tables, e900004, teams[H], teams[X],
+            [_bat(HB1, True, 4, 3, 0, 0, 2, 0, 0, 0, 0, 0, 0)], player_cache,
         )
     return db, tables, target_id

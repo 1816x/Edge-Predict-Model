@@ -99,7 +99,67 @@ def test_starter_block_hand_computed_values(seeded):
     )
     assert away["bullpen_ip_expected"] == 5.0  # SP2: 15 outs in his one start
 
-    assert features["feature_version"] == "team_form_sp_bp_v3"
+    assert features["feature_version"] == "team_form_sp_bp_off_v4"
+
+
+def test_offense_block_hand_computed_values(seeded):
+    """docs/04 §1.2 block for the July 6th game (D = Jul 6, windows are UTC
+    days ending Jul 5). Every number below is pencil-derived from the
+    conftest batting seeds with the frozen 2017 weights.
+
+    Away (H, probables say it faces SP1 = R):
+      30d window = e900001 only (e900003 is Jun 5, one day OUTSIDE the
+      [Jun 6, Jul 5] window; H's own same-day line on e900002 must be
+      excluded by the intraday rule): AB6 H3 2B1 3B1 BB2 HBP1 SF0 SH1 ->
+      woba_den 9, num = 2*.693 + .723 + .877 + 1.232 + 1.552 = 5.770.
+      Season adds e900003 (num 3.212 / den 8).
+      Split vs R: 30d has NO R-classified game (e900001's opposing side
+      archived no starter -> NULL hand), trailing year has e900003 (vs
+      SP1, R): pure prior = 3.212/8.
+    Home (X, faces SP2 = L):
+      30d = e900005 (NULL hand) + e900001 (vs SP2, L): AB7 H2 BB1 ->
+      woba_den 8, num = .693 + 2*.877 = 2.447; same-day X line on
+      e900002 excluded. Split vs L: window == target (e900001 only,
+      1.570/5) -> shrunk value equals the raw split.
+    """
+    from sqlalchemy import text
+
+    db, tables, _ = seeded
+    with db.connect() as conn:
+        event_id = conn.execute(
+            text("SELECT id FROM events WHERE external_ids ->> 'mlb_game_pk' = '900002'")
+        ).scalar_one()
+        features = builder.build_features(
+            conn, tables, event_id, "moneyline",
+            datetime(2026, 7, 6, 23, 0, tzinfo=timezone.utc),
+        )
+
+    away = features["away"]  # H
+    assert away["team_woba_30d"] == round(5.770 / 9, 4)
+    assert away["team_woba_season"] == round(8.982 / 17, 4)
+    assert away["team_woba_vs_opp_hand_30d"] == round(3.212 / 8, 4)
+    assert away["team_iso_30d"] == round((6 - 3) / 6, 4)  # TB 6 (1B+2B+3B)
+    assert away["team_k_pct_30d"] == round(2 / 10, 4)  # PA = 6+2+1+0+1
+    assert away["team_bb_pct_30d"] == round(2 / 10, 4)
+    assert away["team_ops_30d"] == round(6 / 9 + 6 / 6, 4)  # OBP + SLG
+
+    home = features["home"]  # X
+    assert home["team_woba_30d"] == round(2.447 / 8, 4)
+    assert home["team_woba_season"] == home["team_woba_30d"]  # same two games
+    # (1.570 + 200 * (1.570/5)) / (5 + 200) == 1.570/5 == 0.314 exactly.
+    assert home["team_woba_vs_opp_hand_30d"] == 0.314
+    assert home["team_iso_30d"] == 0.0  # two singles: a TRUE zero, not NULL
+    assert home["team_k_pct_30d"] == round(3 / 8, 4)
+    assert home["team_bb_pct_30d"] == round(1 / 8, 4)
+    assert home["team_ops_30d"] == round(3 / 8 + 2 / 7, 4)
+
+    # F5 carries the same offense block (only bullpen is excluded from F5).
+    with db.connect() as conn:
+        f5 = builder.build_features(
+            conn, tables, event_id, "f5_moneyline",
+            datetime(2026, 7, 6, 23, 0, tzinfo=timezone.utc),
+        )
+    assert f5["away"]["team_woba_30d"] == away["team_woba_30d"]
 
 
 def test_bullpen_block_is_none_before_the_archive_is_alive(seeded):
@@ -143,12 +203,24 @@ def test_f5_vector_excludes_bullpen_by_design(seeded):
 
 
 def test_starter_block_none_without_probable(seeded):
-    """The target game has no probables recorded: the whole block is None."""
+    """The target game has no probables recorded: the whole block is None.
+
+    The offense vs-hand split is selected by the opposing PROBABLE's hand,
+    so it must be None too — while the rest of the offense block keeps its
+    values (home) or stays None because the team has no batting archive at
+    all (away, the A team): no fabricated zeros either way."""
     db, tables, target_id = seeded
     with db.connect() as conn:
         features = builder.build_features(conn, tables, target_id, "moneyline", AS_OF)
     for side in ("home", "away"):
         assert all(features[side][name] is None for name in builder.SP_FEATURES)
+        assert features[side]["team_woba_vs_opp_hand_30d"] is None
+    # H's 30d window for the July 8th target: e900001 + e900002 (yesterday
+    # relative to game day counts): (5.770 + 3.157) / (9 + 5).
+    assert features["home"]["team_woba_30d"] == round(8.927 / 14, 4)
+    assert features["home"]["team_woba_season"] == round(12.139 / 22, 4)
+    for name in builder.OFFENSE_FEATURE_NAMES:
+        assert features["away"][name] is None, name
 
 
 def test_future_game_never_leaks(seeded):

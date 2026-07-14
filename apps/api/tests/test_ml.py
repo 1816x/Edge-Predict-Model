@@ -93,6 +93,7 @@ class TestWalkForward:
             # constant-0.5 baseline on log loss.
             assert rep["hist_gb"]["calibrated"]["log_loss"] < rep["baseline_constant"]["log_loss"]
             assert rep["logistic"]["calibrated"]["log_loss"] < rep["baseline_constant"]["log_loss"]
+            assert rep["logistic_scaled"]["calibrated"]["log_loss"] < rep["baseline_constant"]["log_loss"]
 
     def test_f5_market_drops_pushes(self):
         games = _synthetic_games(n_seasons=2, per_season=60)
@@ -274,9 +275,116 @@ class TestBullpenFeatures:
         ml = ds.build_training_frame(games, "moneyline")
         assert not any("bullpen" in c for c in f5.columns)
         assert sum("bullpen" in c for c in ml.columns) == 8
-        assert len(ds.FEATURE_COLUMNS) == 40
-        assert len(ds.F5_FEATURE_COLUMNS) == 32
+        # The offense block (docs/04 §1.2) enters BOTH vectors: 7 per side.
+        assert sum("team_woba" in c or "team_ops" in c or "team_iso" in c
+                   or "team_k_pct" in c or "team_bb_pct" in c for c in f5.columns) == 14
+        assert len(ds.FEATURE_COLUMNS) == 54
+        assert len(ds.F5_FEATURE_COLUMNS) == 46
         assert ds.feature_columns("f5_moneyline") == ds.F5_FEATURE_COLUMNS
+
+
+def _synthetic_offense_frames():
+    """Team T1's aggregated batting games around a 2024-04-20 target (D).
+
+    Dates chosen to pin every window edge:
+      rZ 2023-04-01 (before D-365: excluded everywhere; absurd numbers
+         make any leak visible), hand L
+      rB 2023-12-20 (prev year: split target yes, season no), hand L
+      rC 2024-03-21 (= D-30: inside the 30d window edge), hand None
+      rD 2024-03-20 (= D-31: outside 30d, inside season/365), hand L
+      rE 2024-04-19 (= D-1: inside everything), hand L
+      rF 2024-04-20 (same day as D: excluded, intraday-safe rule), hand L
+    """
+    def _row(eid, day, hand, ab, h, d2, d3, hr, bb, ibb, so, hbp, sf, sh):
+        return dict(
+            event_id=eid, team_id="T1", is_home=True,
+            start_time_utc=datetime(*day, 23, 0, tzinfo=timezone.utc),
+            at_bats=ab, hits=h, doubles=d2, triples=d3, home_runs=hr,
+            walks=bb, intentional_walks=ibb, strikeouts=so, hit_by_pitch=hbp,
+            sac_flies=sf, sac_bunts=sh, opp_starter_hand=hand,
+        )
+
+    batting = pd.DataFrame(
+        [
+            _row("bZ", (2023, 4, 1), "L", 10, 10, 0, 0, 10, 0, 0, 0, 0, 0, 0),
+            _row("bB", (2023, 12, 20), "L", 8, 2, 0, 0, 0, 2, 0, 3, 0, 0, 0),
+            _row("bC", (2024, 3, 21), None, 5, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0),
+            _row("bD", (2024, 3, 20), "L", 6, 3, 1, 0, 1, 0, 0, 2, 0, 0, 0),
+            _row("bE", (2024, 4, 19), "L", 4, 2, 0, 0, 0, 1, 1, 1, 0, 1, 0),
+            _row("bF", (2024, 4, 20), "L", 3, 3, 0, 0, 3, 0, 0, 0, 0, 0, 0),
+        ]
+    )
+    batting["start_time_utc"] = pd.to_datetime(batting["start_time_utc"], utc=True)
+    games = pd.DataFrame(
+        [
+            dict(event_id="g1", home_team_id="T1", away_team_id="T2",
+                 start_time_utc=datetime(2024, 4, 20, 20, 0, tzinfo=timezone.utc)),
+            dict(event_id="g2", home_team_id="T1", away_team_id="T2",
+                 start_time_utc=datetime(2024, 4, 20, 12, 0, tzinfo=timezone.utc)),
+        ]
+    )
+    games["start_time_utc"] = pd.to_datetime(games["start_time_utc"], utc=True)
+    # g1's opposing starter is a lefty; g2's hand is unknown (no starter).
+    return batting, games, {("g1", "home"): "L"}
+
+
+class TestOffenseFeatures:
+    """Hand-computed values with the frozen 2017 weights.
+
+    wOBA parts per row: rB num 2*.693 + 2*.877 = 3.140, den 10;
+    rC num .877, den 5; rD num .877 + 1.232 + 1.98 = 4.089, den 6;
+    rE num 2*.877 = 1.754, den 4+1-1+1 = 5.
+    """
+
+    def _row(self, event_id="g1"):
+        batting, games, hand = _synthetic_offense_frames()
+        feats = ds._offense_features(batting, games, hand)
+        return feats[feats["event_id"] == event_id].iloc[0]
+
+    def test_30d_window_edges_and_same_day_exclusion(self):
+        # 30d = [D-30, D-1] = rC + rE only: rD sits one day outside, rF is
+        # same-day. woba = (0.877 + 1.754) / (5 + 5) = 0.2631.
+        row = self._row()
+        assert row["home_team_woba_30d"] == pytest.approx(round(2.631 / 10, 4))
+        # PA = 9+1+0+1+0 = 11; K 3, BB 1. TB = 3 singles, ISO true zero.
+        assert row["home_team_k_pct_30d"] == pytest.approx(round(3 / 11, 4))
+        assert row["home_team_bb_pct_30d"] == pytest.approx(round(1 / 11, 4))
+        assert row["home_team_iso_30d"] == 0.0
+        assert row["home_team_ops_30d"] == pytest.approx(round(4 / 11 + 3 / 9, 4))
+
+    def test_season_excludes_prior_year(self):
+        # Season 2024 = rD + rC + rE (rB is December, rZ is out of range):
+        # (4.089 + 0.877 + 1.754) / (6 + 5 + 5) = 0.42.
+        row = self._row()
+        assert row["home_team_woba_season"] == pytest.approx(0.42)
+
+    def test_split_shrinks_toward_trailing_year(self):
+        # 30d L-games: rE only (1.754/5). Trailing-year L-target: rB+rD+rE
+        # = 8.983/21 (rZ excluded: before D-365; rC has no hand).
+        # (1.754 + 200*(8.983/21)) / (5 + 200) = 0.4259 — NOT the raw 30d
+        # split, NOT the target: genuinely shrunk.
+        row = self._row()
+        expected = (1.754 + 200 * (8.983 / 21)) / 205
+        assert row["home_team_woba_vs_opp_hand_30d"] == pytest.approx(round(expected, 4))
+        assert round(expected, 4) not in (round(1.754 / 5, 4), round(8.983 / 21, 4))
+
+    def test_unknown_hand_and_missing_archive_stay_nan(self):
+        row_g2 = self._row("g2")
+        # g2 has no known opposing hand: the split is unknowable.
+        assert pd.isna(row_g2["home_team_woba_vs_opp_hand_30d"])
+        # ...but the rest of the block still computes.
+        assert row_g2["home_team_woba_30d"] == pytest.approx(round(2.631 / 10, 4))
+        # T2 never batted: its whole block is NaN, never zeros.
+        for name in ds.OFFENSE_FEATURE_NAMES:
+            assert pd.isna(self._row()[f"away_{name}"]), name
+
+    def test_no_batting_frame_degrades_to_nan_and_still_trains(self):
+        games = _synthetic_games()
+        frame = ds.build_training_frame(games, "moneyline", batting=None)
+        off_cols = [c for c in ds.FEATURE_COLUMNS if "team_woba" in c]
+        assert frame[off_cols].isna().all().all()
+        report = tr.walk_forward_report(frame, min_train_seasons=4)
+        assert sorted(report["seasons"]) == [2022, 2023]
 
 
 class TestMarketPriorSubset:
@@ -320,11 +428,41 @@ class TestMarketPriorSubset:
         assert sub["gate"]["evaluated"] is True
         # Against a coin-flip prior the learned models must win (same claim
         # the baseline_constant assertion makes on the full season).
-        assert sub["gate"]["beaten_by"] == {"logistic": True, "hist_gb": True}
+        assert sub["gate"]["beaten_by"] == {
+            "logistic": True, "logistic_scaled": True, "hist_gb": True,
+        }
 
         import json
 
         json.dumps(report)
+
+
+def test_markdown_summary_renders_every_model_column():
+    """_markdown_summary hardcodes per-model keys (logistic, logistic_scaled,
+    hist_gb) in the season and prior tables and is otherwise only executed
+    by __main__ in production: without this test, renaming or dropping a
+    model keeps the suite green and kills the Actions run at the finish
+    line (the int32 json.dumps incident, same shape). Renders BOTH tables."""
+    from app.jobs import train_f1
+
+    frame = ds.build_training_frame(_synthetic_games(), "moneyline")
+    frame["market_prior_p_home"] = np.nan
+    frame.loc[frame["season"] == 2023, "market_prior_p_home"] = 0.5
+    report = tr.walk_forward_report(frame, min_train_seasons=4)
+    result = {
+        "markets": {
+            "moneyline": {
+                "rows": int(len(frame)), "seasons": [2018, 2023],
+                "sp_coverage": 0.0, "offense_coverage": 0.0,
+                "bullpen_coverage": 0.0, "rows_with_market_prior": 0,
+                "report": report,
+            }
+        },
+        "gate_note": "nota",
+    }
+    md = train_f1._markdown_summary(result)
+    assert "| 2022 |" in md and "| 2023 |" in md  # season rows rendered
+    assert "Subconjunto con market prior" in md  # prior table rendered
 
 
 @pytest.mark.integration
@@ -388,6 +526,11 @@ def test_train_f1_job_reports_sp_coverage(seeded):
     # Reliever archive comes alive after June 5th: 4 of 5 games covered.
     assert block["bullpen_coverage"] == 0.8
     assert "bullpen_coverage" not in result["markets"]["f5_moneyline"]
+    # Offense: e900001/e900002/e900004 have both teams with a real 30d
+    # batting window; e900003 predates the archive and e900005's home team
+    # (A) never bats in the seeds.
+    assert block["offense_coverage"] == 0.6
+    assert "batting_note" not in result
     # Not enough seasons to test anything: the report stays honest and empty.
     assert block["report"]["seasons"] == {}
 
@@ -401,7 +544,11 @@ def test_bulk_features_match_online_builder(seeded):
     from app.features import builder
     from app.ml.dataset import build_training_frame, load_results_frame
 
-    from app.ml.dataset import load_bullpen_frame, load_pitching_frame
+    from app.ml.dataset import (
+        load_batting_frame,
+        load_bullpen_frame,
+        load_pitching_frame,
+    )
 
     db, tables, target_id = seeded
     games = load_results_frame(db)
@@ -409,11 +556,13 @@ def test_bulk_features_match_online_builder(seeded):
     # The online builder computed the July 5th game's form for team H; the
     # bulk frame's row for that same game must match field by field. The
     # seeded probables MATCH the actual starters, so the starter block must
-    # agree too (probable-based online vs actual-starter bulk). The bullpen
-    # block (day windows) must agree as well.
+    # agree too (probable-based online vs actual-starter bulk, and the
+    # offense split's selected hand likewise). The bullpen and offense
+    # blocks (day windows) must agree as well.
     frame = build_training_frame(
         games, "moneyline",
         pitching=load_pitching_frame(db), bullpen=load_bullpen_frame(db),
+        batting=load_batting_frame(db),
     )
     with db.connect() as conn:
         # as_of == start time (training convention) for the July 6th game,
@@ -430,6 +579,7 @@ def test_bulk_features_match_online_builder(seeded):
         "games_30d", "win_pct_30d", "runs_pg_30d", "runs_allowed_pg_30d",
         "f5_games_30d", "f5_runs_pg_30d", "f5_runs_allowed_pg_30d",
         "rest_days", "games_last_7d",
+        *ds.OFFENSE_FEATURE_NAMES,
         *ds.SP_FEATURE_NAMES,
         *ds.BP_FEATURE_NAMES,
     ):

@@ -18,6 +18,11 @@ own archive:
   CALENDAR DAYS (UTC) ending YESTERDAY, not timestamps: the intraday-safe
   rule of §1.1 (we cannot guarantee that a doubleheader's game 1 finished
   before decision time, so same-day games are excluded wholesale).
+- team offense (§1.2, BOTH markets): wOBA/OPS/ISO/K%/BB% over the batting
+  archive (migration 004), day windows ending yesterday like the bullpen
+  block, plus a vs-opposing-hand wOBA split selected by the as-of
+  probable's handedness and shrunk toward the team's trailing-year split.
+  Formulas are shared with the bulk path via app/features/offense.py.
 
 NOT implemented yet (no placeholder numbers are fabricated for them):
 - closer_available_flag (§1.4): TODO(F1.2) — needs transactions/IL ingest
@@ -45,6 +50,17 @@ from typing import Any
 from sqlalchemy import Date, Table, cast, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection
+
+from app.features.offense import (
+    OFFENSE_FEATURE_NAMES,
+    OFFENSE_ROLLING_DAYS,
+    OFFENSE_SPLIT_TARGET_DAYS,
+    SUM_KEYS,
+    offense_rates,
+    shrunk_split,
+    woba,
+    woba_parts,
+)
 
 ROLLING_WINDOW = timedelta(days=30)
 RECENT_WINDOW = timedelta(days=7)
@@ -98,6 +114,7 @@ FEATURE_TABLES = (
     "players",
     "pitching_game_logs",
     "event_probables",
+    "batting_game_logs",
 )
 
 
@@ -399,6 +416,82 @@ def _bullpen_block(
     return block
 
 
+def _offense_block(
+    conn: Connection,
+    t: dict[str, Table],
+    team_id: uuid.UUID,
+    event_day,
+    opp_hand: str | None,
+) -> dict[str, Any]:
+    """docs/04 §1.2 team offense for one side, day windows ending YESTERDAY.
+
+    Windows are UTC calendar days [D-30, D-1] (and season-to-date / the
+    trailing year for the split target) — the intraday-safe rule of §1.1,
+    exactly like the bullpen block: a doubleheader's game 1 can never leak
+    into game 2's vector.
+
+    ``opp_hand`` is the L/R hand of the OPPOSING probable starter at
+    as_of (None when unknown): it selects which starter-hand split the
+    shrunk vs-hand feature reports. Split classification of PAST games
+    uses the actual starter faced (the opposing side's is_starter row) —
+    a boxscore-computable proxy for true PA-level splits, documented in
+    docs/00. Empty windows are None per rate: a team with no archived
+    batting contributes Nones, never fabricated zeros.
+    """
+    block: dict[str, Any] = {name: None for name in OFFENSE_FEATURE_NAMES}
+    batting, events = t["batting_game_logs"], t["events"]
+    logs, players = t["pitching_game_logs"], t["players"]
+    day = _utc_day_expr(events)
+
+    starter_hand = (
+        select(logs.c.event_id, logs.c.is_home, players.c.pitch_hand)
+        .select_from(logs.join(players, players.c.id == logs.c.player_id))
+        .where(logs.c.is_starter)
+        .subquery()
+    )
+    rows = conn.execute(
+        select(
+            day.label("day"),
+            *[func.sum(batting.c[key]).label(key) for key in SUM_KEYS],
+            func.max(starter_hand.c.pitch_hand).label("opp_hand"),
+        )
+        .select_from(
+            batting.join(events, events.c.id == batting.c.event_id).outerjoin(
+                starter_hand,
+                (starter_hand.c.event_id == batting.c.event_id)
+                & (starter_hand.c.is_home != batting.c.is_home),
+            )
+        )
+        .where(
+            batting.c.team_id == team_id,
+            day >= event_day - timedelta(days=OFFENSE_SPLIT_TARGET_DAYS),
+            day < event_day,
+        )
+        .group_by(batting.c.event_id, day)
+    ).all()
+    if not rows:
+        return block
+
+    def _sums(subset) -> dict[str, float]:
+        return {key: float(sum(getattr(r, key) for r in subset)) for key in SUM_KEYS}
+
+    floor_30 = event_day - timedelta(days=OFFENSE_ROLLING_DAYS)
+    win30 = [r for r in rows if r.day >= floor_30]
+    block.update(offense_rates(_sums(win30)))
+    season = [r for r in rows if r.day >= event_day.replace(month=1, day=1)]
+    if season:
+        block["team_woba_season"] = woba(_sums(season))
+    if opp_hand in ("L", "R"):
+        hand30 = [r for r in win30 if r.opp_hand == opp_hand]
+        hand365 = [r for r in rows if r.opp_hand == opp_hand]
+        num_30, den_30 = woba_parts(_sums(hand30))
+        num_365, den_365 = woba_parts(_sums(hand365))
+        block["team_woba_vs_opp_hand_30d"] = shrunk_split(
+            num_30, den_30, num_365, den_365
+        )
+    return block
+
+
 def _starter_block(
     conn: Connection,
     t: dict[str, Table],
@@ -526,6 +619,7 @@ def build_features(
         )
 
     league = _league_pitching(conn, t, event.sport_id, as_of_ts)
+    event_day = _utc_date(event.start_time_utc)
     sides = {}
     for side, team_id in (("home", event.home_team_id), ("away", event.away_team_id)):
         sides[side] = {
@@ -537,11 +631,18 @@ def build_features(
             ),
         }
 
+    # Offense block (§1.2), BOTH markets. Second loop on purpose: the
+    # vs-hand split is selected by the OPPOSING probable's handedness,
+    # which the starter block above already resolved as sp_is_lhp.
+    for side, team_id in (("home", event.home_team_id), ("away", event.away_team_id)):
+        opp = "away" if side == "home" else "home"
+        opp_hand = {1: "L", 0: "R"}.get(sides[opp].get("sp_is_lhp"))
+        sides[side].update(_offense_block(conn, t, team_id, event_day, opp_hand))
+
     # Bullpen block enters the MONEYLINE vector only: leverage relievers do
     # not participate in innings 1-5, so F5 excludes it BY DESIGN — the
     # features are removed, not zero-weighted (docs/04 §1.4).
     if market == "moneyline":
-        event_day = _utc_date(event.start_time_utc)
         league_bp = _league_bullpen(conn, t, event.sport_id, event_day)
         for side, team_id in (("home", event.home_team_id), ("away", event.away_team_id)):
             sides[side].update(
@@ -555,7 +656,7 @@ def build_features(
     # column, and keeping it out lets identical vectors captured at different
     # times dedupe on (event, market, feature_hash) as the schema intends.
     return {
-        "feature_version": "team_form_sp_bp_v3",
+        "feature_version": "team_form_sp_bp_off_v4",
         "market": market,
         "home": sides["home"],
         "away": sides["away"],

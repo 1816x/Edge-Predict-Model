@@ -7,7 +7,10 @@ builder) in vectorized form over the whole events/event_results archive:
 - F5 aggregates only over games with F5 partials recorded,
 - rest days vs the previous game, 7-day schedule density,
 - the starter block (docs/04 §1.3): shrunk K-BB% / xFIP-core over the last
-  5 starts and season-to-date, rest days, recent pitch count, handedness.
+  5 starts and season-to-date, rest days, recent pitch count, handedness,
+- the team offense block (docs/04 §1.2): wOBA/OPS/ISO/K%/BB% over UTC-day
+  windows ending yesterday plus the vs-opposing-hand shrunk wOBA split
+  (formulas shared with the online builder via app/features/offense.py).
 
 One deliberate train/serve difference: training rows use the ACTUAL starter
 (``pitching_game_logs.is_starter``) because that is who generated the
@@ -32,6 +35,17 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+from app.features.offense import (
+    OFFENSE_FEATURE_NAMES,
+    OFFENSE_ROLLING_DAYS,
+    OFFENSE_SPLIT_TARGET_DAYS,
+    SUM_KEYS,
+    offense_rates,
+    shrunk_split,
+    woba,
+    woba_parts,
+)
 
 ROLLING_DAYS = 30
 RECENT_DAYS = 7
@@ -84,16 +98,19 @@ _TEAM_FORM_NAMES = (
 
 # Moneyline vector: everything. F5 excludes the bullpen block BY DESIGN —
 # leverage relievers do not participate in innings 1-5, so the features
-# are removed rather than zero-weighted (docs/04 §1.4).
+# are removed rather than zero-weighted (docs/04 §1.4). The offense block
+# (§1.2) enters BOTH markets.
 FEATURE_COLUMNS = [
     f"{side}_{name}"
     for side in ("home", "away")
-    for name in (*_TEAM_FORM_NAMES, *SP_FEATURE_NAMES, *BP_FEATURE_NAMES)
+    for name in (
+        *_TEAM_FORM_NAMES, *OFFENSE_FEATURE_NAMES, *SP_FEATURE_NAMES, *BP_FEATURE_NAMES
+    )
 ]
 F5_FEATURE_COLUMNS = [
     f"{side}_{name}"
     for side in ("home", "away")
-    for name in (*_TEAM_FORM_NAMES, *SP_FEATURE_NAMES)
+    for name in (*_TEAM_FORM_NAMES, *OFFENSE_FEATURE_NAMES, *SP_FEATURE_NAMES)
 ]
 
 
@@ -180,6 +197,48 @@ def load_bullpen_frame(engine: Engine, sport: str = "mlb") -> pd.DataFrame:
     """One row per RELIEVER line per game (bullpen block, docs/04 §1.4)."""
     with engine.connect() as conn:
         df = pd.read_sql(text(_BULLPEN_SQL), conn, params={"sport": sport})
+    df["start_time_utc"] = pd.to_datetime(df["start_time_utc"], utc=True)
+    return df
+
+
+_BATTING_SQL = """
+SELECT b.event_id,
+       b.team_id,
+       b.is_home,
+       e.start_time_utc,
+       sum(b.at_bats) AS at_bats,
+       sum(b.hits) AS hits,
+       sum(b.doubles) AS doubles,
+       sum(b.triples) AS triples,
+       sum(b.home_runs) AS home_runs,
+       sum(b.walks) AS walks,
+       sum(b.intentional_walks) AS intentional_walks,
+       sum(b.strikeouts) AS strikeouts,
+       sum(b.hit_by_pitch) AS hit_by_pitch,
+       sum(b.sac_flies) AS sac_flies,
+       sum(b.sac_bunts) AS sac_bunts,
+       max(ph.pitch_hand) AS opp_starter_hand
+FROM batting_game_logs b
+JOIN events e ON e.id = b.event_id
+JOIN sports s ON s.id = e.sport_id
+LEFT JOIN (
+    SELECT l.event_id, l.is_home, p.pitch_hand
+    FROM pitching_game_logs l
+    JOIN players p ON p.id = l.player_id
+    WHERE l.is_starter
+) ph ON ph.event_id = b.event_id AND ph.is_home <> b.is_home
+WHERE s.key = :sport
+GROUP BY b.event_id, b.team_id, b.is_home, e.start_time_utc
+ORDER BY e.start_time_utc
+"""
+
+
+def load_batting_frame(engine: Engine, sport: str = "mlb") -> pd.DataFrame:
+    """One row per (game, team): aggregated batting sums plus the hand of
+    the ACTUAL opposing starter (the split-classification proxy, docs/04
+    §1.2 — NULL when that side has no starter row or an unknown hand)."""
+    with engine.connect() as conn:
+        df = pd.read_sql(text(_BATTING_SQL), conn, params={"sport": sport})
     df["start_time_utc"] = pd.to_datetime(df["start_time_utc"], utc=True)
     return df
 
@@ -549,6 +608,133 @@ def _bullpen_features(bullpen: pd.DataFrame, games: pd.DataFrame) -> pd.DataFram
     return features
 
 
+def _opp_hand_map(pitching: pd.DataFrame | None) -> dict:
+    """(event_id, side) -> 'L'/'R' hand of the side's OPPOSING actual
+    starter, from the starter rows (training convention: the actual
+    starter, like the sp block — the online builder uses the probable)."""
+    if pitching is None or len(pitching) == 0:
+        return {}
+    hands: dict = {}
+    for row in pitching.itertuples():
+        if row.pitch_hand in ("L", "R"):
+            # The starter on is_home answers the OTHER side's split.
+            hands[(row.event_id, "away" if row.is_home else "home")] = row.pitch_hand
+    return hands
+
+
+def _offense_features(
+    batting: pd.DataFrame, games: pd.DataFrame, opp_hand: dict
+) -> pd.DataFrame:
+    """Per-game offense block (bulk twin of builder._offense_block).
+
+    Windows are UTC calendar days ending YESTERDAY relative to each game's
+    day (intraday-safe rule, §1.1): 30d rates, season-to-date wOBA, and a
+    vs-opposing-hand wOBA split shrunk toward the trailing-year same-hand
+    split. Window sums come from per-team cumulative arrays (overall and
+    per opposing hand) and feed the SAME shared formulas the online
+    builder uses (app/features/offense.py) — window parity is what the
+    online/bulk test checks; formula parity holds by construction.
+    Teams with no archived batting stay NaN — never fabricated.
+    """
+    bt = batting.sort_values("start_time_utc").reset_index(drop=True)
+    days = _utc_epoch_days(bt["start_time_utc"])
+    raw = {k: bt[k].to_numpy(dtype=float) for k in SUM_KEYS}
+    hand_col = bt["opp_starter_hand"].to_numpy(dtype=object)
+
+    def _cum(a: np.ndarray) -> np.ndarray:
+        return np.concatenate([[0.0], np.cumsum(a)])
+
+    teams: dict = {}
+    for team_id, group in bt.groupby("team_id", sort=False):
+        pos = group.index.to_numpy()
+        entry: dict = {"days": days[pos]}
+        for key in SUM_KEYS:
+            entry[key] = _cum(raw[key][pos])
+            for hand in ("L", "R"):
+                mask = (hand_col[pos] == hand).astype(float)
+                entry[f"{hand}_{key}"] = _cum(raw[key][pos] * mask)
+        teams[team_id] = entry
+
+    game_days = _utc_epoch_days(games["start_time_utc"])
+    game_years = (
+        games["start_time_utc"].dt.tz_convert("UTC").dt.year.to_numpy(dtype=int)
+    )
+    event_ids = games["event_id"].to_numpy(dtype=object)
+    team_cols = {
+        "home": games["home_team_id"].to_numpy(dtype=object),
+        "away": games["away_team_id"].to_numpy(dtype=object),
+    }
+    out = {
+        f"{side}_{name}": np.full(len(games), np.nan)
+        for side in ("home", "away")
+        for name in OFFENSE_FEATURE_NAMES
+    }
+
+    def _window_sums(entry: dict, lo: int, hi: int, prefix: str = "") -> dict:
+        return {
+            key: float(entry[f"{prefix}{key}"][hi] - entry[f"{prefix}{key}"][lo])
+            for key in SUM_KEYS
+        }
+
+    for i in range(len(games)):
+        day = int(game_days[i])
+        jan1 = int(
+            np.datetime64(f"{game_years[i]}-01-01").astype("datetime64[D]").astype(int)
+        )
+        for side in ("home", "away"):
+            entry = teams.get(team_cols[side][i])
+            if entry is None:
+                continue  # no archived batting for this team: NaN block
+            d = entry["days"]
+            hi = int(np.searchsorted(d, day, side="left"))
+            lo30 = int(np.searchsorted(d, day - OFFENSE_ROLLING_DAYS, side="left"))
+            lo365 = int(
+                np.searchsorted(d, day - OFFENSE_SPLIT_TARGET_DAYS, side="left")
+            )
+            if hi == lo365:
+                continue  # nothing in the trailing year: None, like online
+            los = int(np.searchsorted(d, jan1, side="left"))
+            for name, value in offense_rates(_window_sums(entry, lo30, hi)).items():
+                if value is not None:
+                    out[f"{side}_{name}"][i] = value
+            if hi > los:
+                season_woba = woba(_window_sums(entry, los, hi))
+                if season_woba is not None:
+                    out[f"{side}_team_woba_season"][i] = season_woba
+            hand = opp_hand.get((event_ids[i], side))
+            if hand in ("L", "R"):
+                num_30, den_30 = woba_parts(
+                    _window_sums(entry, lo30, hi, prefix=f"{hand}_")
+                )
+                num_365, den_365 = woba_parts(
+                    _window_sums(entry, lo365, hi, prefix=f"{hand}_")
+                )
+                split = shrunk_split(num_30, den_30, num_365, den_365)
+                if split is not None:
+                    out[f"{side}_team_woba_vs_opp_hand_30d"][i] = split
+
+    features = pd.DataFrame(out)
+    features["event_id"] = games["event_id"].to_numpy()
+    return features
+
+
+def _merge_offense_features(
+    frame: pd.DataFrame,
+    batting: pd.DataFrame | None,
+    games: pd.DataFrame,
+    opp_hand: dict,
+) -> pd.DataFrame:
+    """Attach the offense columns; NaN block when no batting was loaded."""
+    if batting is None or len(batting) == 0:
+        for side in ("home", "away"):
+            for name in OFFENSE_FEATURE_NAMES:
+                frame[f"{side}_{name}"] = np.nan
+        return frame
+    return frame.merge(
+        _offense_features(batting, games, opp_hand), on="event_id", how="left"
+    )
+
+
 def _merge_bullpen_features(
     frame: pd.DataFrame, bullpen: pd.DataFrame | None, games: pd.DataFrame
 ) -> pd.DataFrame:
@@ -590,6 +776,7 @@ def build_training_frame(
     market: str,
     pitching: pd.DataFrame | None = None,
     bullpen: pd.DataFrame | None = None,
+    batting: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Game rows with home_/away_ features, target and season.
 
@@ -598,11 +785,15 @@ def build_training_frame(
     market='f5_moneyline': target = home led after 5 innings; F5 ties (push)
     and games without F5 partials are dropped — a push is not a loss and
     teaching the model otherwise would poison it. The F5 vector EXCLUDES
-    the bullpen block by design (docs/04 §1.4).
+    the bullpen block by design (docs/04 §1.4); the offense block (§1.2)
+    enters both markets.
 
-    ``pitching``/``bullpen`` are the loaders' outputs; without them the
-    corresponding columns are NaN (the models impute, the report says so —
-    never silently fabricated).
+    ``pitching``/``bullpen``/``batting`` are the loaders' outputs; without
+    them the corresponding columns are NaN (the models impute, the report
+    says so — never silently fabricated). The offense split's selected
+    hand comes from the pitching frame (actual starters): without pitching
+    the split column is NaN even when batting exists, mirroring the online
+    builder without a known probable.
     """
     if market not in ("moneyline", "f5_moneyline"):
         raise ValueError(f"unknown market {market!r}")
@@ -623,6 +814,7 @@ def build_training_frame(
         right_on=["away_event_id", "away_team_id"],
     )
     frame = _merge_starter_features(frame, pitching)
+    frame = _merge_offense_features(frame, batting, games, _opp_hand_map(pitching))
     if market == "moneyline":
         frame = _merge_bullpen_features(frame, bullpen, games)
 

@@ -7,12 +7,29 @@
 # Notas operativas:
 # - Los schedules SOLO corren en la rama default (main): hay que mergear
 #   la rama de desarrollo para que arranquen.
-# - Los minutos de los cron son deliberadamente "raros" (17, 23, 7, 37):
+# - Los minutos de los cron son deliberadamente "raros" (17, 23, 53, 7, 37):
 #   GitHub degrada los schedules del minuto :00 en horas pico — el
 #   2026-07-09 el cron de 14:00 llevaba +100 min sin disparar y los del
 #   día anterior salieron con 1-4 h de retraso. Minutos fuera de la hora
 #   en punto reducen (no eliminan) ese retraso; el job audit_snapshots
 #   detecta los huecos que igual se cuelen.
+# - Los slots de snapshot son REDUNDANTES (:23 y :53 de cada hora de
+#   captura): el 2026-07-10 el cron diario salió con 2h18m de retraso y
+#   hubo que recuperar el día a mano (runs #39-#43). Con dos slots por
+#   hora, un retraso de 1-2 h en uno ya no puede abrir un hueco > 4 h
+#   (el umbral del audit) sin que el otro lo cubra. Costo: ~4 requests
+#   extra al día a The Odds API — caben de sobra en el free tier con F5
+#   apagado. Ambos slots comparten grupo de concurrency: si el de :23
+#   sigue encolado cuando dispara el de :53, GitHub reemplaza el
+#   pendiente — exactamente la deduplicación que se quiere.
+# - El cron DIARIO también captura un snapshot (además del slate): los
+#   audits del 07-10/11/12 salieron rojos por UN juego temprano por día
+#   (inicio ~16:15Z) cuya única cobertura posible era el slot de 15:23
+#   retrasado por GitHub hasta después del primer pitch — y :23/:53
+#   comparten la misma hora pico, así que la redundancia intra-hora no
+#   salva ese caso. El diario corre a las 14:17 en un grupo de
+#   concurrency DISTINTO: es una tercera oportunidad independiente que
+#   da a los juegos tempranos una captura matinal. Costo: 1 request/día.
 # - GitHub desactiva los schedules tras ~60 dias sin actividad en el
 #   repo; un commit cualquiera los reactiva.
 # - Todos los jobs son idempotentes: una corrida duplicada no ensucia datos.
@@ -23,8 +40,9 @@ on:
   schedule:
     # Slate del dia + resultados/pitcheo de ayer (14:17 UTC ~ manana en America)
     - cron: '17 14 * * *'
-    # snapshot_odds: archivo de lineas en horario de juegos MLB
-    - cron: '23 15,18,21,0 * * *'
+    # snapshot_odds: archivo de lineas en horario de juegos MLB, con
+    # slots redundantes :23/:53 (ver nota de arriba)
+    - cron: '23,53 15,18,21,0 * * *'
     # Closing runs cada 30 min en la ventana de inicios (16:00-04:00 UTC
     # aprox). ALTO consumo de creditos: descomentar al pasar al plan 20K.
     # - cron: '7,37 16-23,0-3 * * *'
@@ -109,6 +127,8 @@ jobs:
             esac
           elif [ "$SCHEDULE" = "17 14 * * *" ]; then
             # Mantenimiento diario del corpus: slate de hoy (con probables),
+            # UN snapshot matinal (la tercera oportunidad independiente que
+            # cubre a los juegos tempranos — ver nota de cabecera),
             # resultados y game logs de los últimos 3 días (lookback: una
             # corrida saltada por GitHub se auto-repara al día siguiente;
             # skip-existing hace el re-proceso casi gratis), y auditoría de
@@ -116,6 +136,7 @@ jobs:
             YDAY=$(date -u -d "yesterday" +%F)
             START=$(date -u -d "3 days ago" +%F)
             python -m app.jobs.sync_schedule
+            python -m app.jobs.snapshot_odds
             python -m app.jobs.backfill_results --start-date "$START" --end-date "$YDAY"
             python -m app.jobs.backfill_pitching --start-date "$START" --end-date "$YDAY"
             python -m app.jobs.audit_snapshots --start-date "$YDAY" --end-date "$YDAY" --fail-on-gaps
