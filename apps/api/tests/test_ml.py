@@ -437,6 +437,34 @@ class TestMarketPriorSubset:
         json.dumps(report)
 
 
+def test_markdown_summary_renders_every_model_column():
+    """_markdown_summary hardcodes per-model keys (logistic, logistic_scaled,
+    hist_gb) in the season and prior tables and is otherwise only executed
+    by __main__ in production: without this test, renaming or dropping a
+    model keeps the suite green and kills the Actions run at the finish
+    line (the int32 json.dumps incident, same shape). Renders BOTH tables."""
+    from app.jobs import train_f1
+
+    frame = ds.build_training_frame(_synthetic_games(), "moneyline")
+    frame["market_prior_p_home"] = np.nan
+    frame.loc[frame["season"] == 2023, "market_prior_p_home"] = 0.5
+    report = tr.walk_forward_report(frame, min_train_seasons=4)
+    result = {
+        "markets": {
+            "moneyline": {
+                "rows": int(len(frame)), "seasons": [2018, 2023],
+                "sp_coverage": 0.0, "offense_coverage": 0.0,
+                "bullpen_coverage": 0.0, "rows_with_market_prior": 0,
+                "report": report,
+            }
+        },
+        "gate_note": "nota",
+    }
+    md = train_f1._markdown_summary(result)
+    assert "| 2022 |" in md and "| 2023 |" in md  # season rows rendered
+    assert "Subconjunto con market prior" in md  # prior table rendered
+
+
 @pytest.mark.integration
 def test_load_market_prior_uses_last_pregame_sharp_pair(seeded):
     from sqlalchemy import text
