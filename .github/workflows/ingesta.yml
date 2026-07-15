@@ -138,8 +138,8 @@ jobs:
             YDAY=$(date -u -d "yesterday" +%F)
             START=$(date -u -d "3 days ago" +%F)
             python -m app.jobs.sync_schedule
-            python -m app.jobs.sync_lineups
             python -m app.jobs.snapshot_odds
+            python -m app.jobs.sync_lineups
             python -m app.jobs.backfill_results --start-date "$START" --end-date "$YDAY"
             python -m app.jobs.backfill_pitching --start-date "$START" --end-date "$YDAY"
             python -m app.jobs.audit_snapshots --start-date "$YDAY" --end-date "$YDAY" --fail-on-gaps
@@ -149,10 +149,13 @@ jobs:
             # Antes de cada snapshot, refrescar slate y probables (1 llamada
             # MLB gratis): auto-repara el slate si el cron diario se saltó y
             # archiva los cambios de probable intradía (scratches) — justo
-            # los eventos donde la línea más se mueve. sync_lineups archiva el
-            # lineup publicado as-of (bloque §1.5): en esta cadencia pre-juego
-            # captura los lineups conforme se publican (~1-4h antes).
+            # los eventos donde la línea más se mueve. El snapshot de odds va
+            # ANTES de sync_lineups: es el dato irreemplazable (no se puede
+            # re-fetchear una línea pasada), y sync_lineups hace N llamadas al
+            # boxscore. sync_lineups archiva el lineup publicado as-of (§1.5)
+            # conforme se publica (~1-4h antes) y es tolerante a fallos por
+            # juego, así que aunque falle no arrastra al snapshot.
             python -m app.jobs.sync_schedule
-            python -m app.jobs.sync_lineups
             python -m app.jobs.snapshot_odds
+            python -m app.jobs.sync_lineups
           fi

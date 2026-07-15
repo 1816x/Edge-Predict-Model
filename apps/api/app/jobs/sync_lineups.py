@@ -46,7 +46,7 @@ from sqlalchemy.exc import InvalidRequestError
 from app.config import get_settings
 from app.db.engine import make_engine
 from app.ingestion import store
-from app.ingestion.mlb_client import MlbClient
+from app.ingestion.mlb_client import MlbApiError, MlbClient
 from app.ingestion.parsers import parse_boxscore_lineup, parse_schedule
 
 _SUMMARY_LIST_CAP = 20
@@ -93,6 +93,7 @@ def run(
         "games_pre_game": 0,
         "games_in_window": 0,
         "boxscores_fetched": 0,
+        "boxscore_errors": 0,
         "missing_events_total": 0,
         "missing_events": [],
         "players_upserted": 0,
@@ -148,7 +149,17 @@ def run(
             summary["missing_events_total"] += 1
             _capped_append(summary, "missing_events", str(game.game_pk))
             continue
-        box = parse_boxscore_lineup(client.get_boxscore(game.game_pk))
+        # One game's boxscore failing must NEVER abort the run: this job is
+        # chained under `set -e` alongside the irreplaceable odds snapshot and
+        # the daily maintenance, so a transient MLB error becomes a summary
+        # anomaly (loud but non-fatal), not a crash that skips those steps.
+        try:
+            payload = client.get_boxscore(game.game_pk)
+        except MlbApiError as exc:
+            summary["boxscore_errors"] += 1
+            _capped_append(summary, "parse_anomalies", f"{game.game_pk}:boxscore_error:{exc}")
+            continue
+        box = parse_boxscore_lineup(payload)
         summary["boxscores_fetched"] += 1
         for anomaly in box.anomalies:
             summary["parse_anomalies_total"] += 1

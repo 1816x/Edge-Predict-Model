@@ -334,6 +334,29 @@ def _boxscore_with_home_leadoff(person_id: int) -> dict:
 
 
 @pytest.mark.integration
+def test_sync_lineups_survives_a_boxscore_error(db):
+    """A single game's boxscore error must NOT crash the job: it is chained
+    under `set -e` before the irreplaceable odds snapshot, so a transient MLB
+    error becomes a summary anomaly, never an abort."""
+    from app.ingestion.mlb_client import MlbApiError
+    from app.jobs import sync_lineups
+
+    _seed_events(db, [910010], date_iso="2026-07-08")
+    client = FakeMlbClient([_schedule_game(910010, "2026-07-08")])
+
+    def _boom(pk):
+        raise MlbApiError("500 boom")
+
+    client.get_boxscore = _boom
+    before = datetime(2026, 7, 8, 20, 0, tzinfo=timezone.utc)
+    result = sync_lineups.run(
+        "2026-07-08", client=client, engine=db, now=before, sleep_seconds=0.0
+    )
+    assert result["boxscore_errors"] == 1
+    assert result["snapshots_new"] == 0  # nothing archived, but no crash
+
+
+@pytest.mark.integration
 def test_placeholder_name_never_clobbers_real_name(db):
     from app.ingestion import store
 
