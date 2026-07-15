@@ -32,6 +32,7 @@ from app.ml.dataset import (
     feature_columns,
     load_batting_frame,
     load_bullpen_frame,
+    load_lineup_frame,
     load_market_prior,
     load_pitching_frame,
     load_results_frame,
@@ -59,6 +60,15 @@ def _bullpen_coverage(frame) -> float:
 def _offense_coverage(frame) -> float:
     """Share of rows where BOTH teams carry a real 30d offense window."""
     both = frame["home_team_woba_30d"].notna() & frame["away_team_woba_30d"].notna()
+    return round(float(both.mean()), 4) if len(frame) else 0.0
+
+
+def _lineup_coverage(frame) -> float:
+    """Share of rows where BOTH lineups carry a real projected wOBA."""
+    both = (
+        frame["home_lineup_woba_proj"].notna()
+        & frame["away_lineup_woba_proj"].notna()
+    )
     return round(float(both.mean()), 4) if len(frame) else 0.0
 
 
@@ -119,22 +129,30 @@ def run(
     # in the 003-but-not-004 state must still train with real sp/bullpen
     # features and only degrade the offense block.
     batting = None
+    lineup = None
     try:
         batting = load_batting_frame(engine)
+        # Same table as batting (migration 004): the lineup block reads the
+        # realized batting_order for backtest composition, so it lives or
+        # dies with the batting archive, not with event_lineups (that table
+        # only feeds the ONLINE builder going forward).
+        lineup = load_lineup_frame(engine)
         if len(batting) == 0:
             batting = None
             out["batting_note"] = (
                 "batting_game_logs is empty; run backfill_pitching "
-                "(team offense features are all NaN this run)"
+                "(team offense and lineup features are all NaN this run)"
             )
+        if lineup is not None and len(lineup) == 0:
+            lineup = None
     except (ProgrammingError, DatabaseError):
         out["batting_note"] = (
             "batting_game_logs missing; apply migration 004 and run "
-            "backfill_pitching (team offense features are all NaN this run)"
+            "backfill_pitching (team offense and lineup features are all NaN)"
         )
 
     for market in markets:
-        frame = build_training_frame(games, market, pitching, bullpen, batting)
+        frame = build_training_frame(games, market, pitching, bullpen, batting, lineup)
         prior = load_market_prior(engine, market)
         frame = frame.merge(prior, on="event_id", how="left")
         block = {
@@ -146,6 +164,9 @@ def run(
             "sp_coverage": _sp_coverage(frame),
             # Same idea for the offense block (both markets carry it).
             "offense_coverage": _offense_coverage(frame),
+            # Lineup block coverage: 0 until the batting backfill fills the
+            # realized batting_order (both markets carry it).
+            "lineup_coverage": _lineup_coverage(frame),
             "rows_with_market_prior": int(frame["market_prior_p_home"].notna().sum()),
             "report": walk_forward_report(
                 frame, min_train_seasons, feature_columns(market)
@@ -166,7 +187,8 @@ def _markdown_summary(result: dict[str, Any]) -> str:
     for market, block in result.get("markets", {}).items():
         coverage = (
             f"sp_coverage {block['sp_coverage']}, "
-            f"offense_coverage {block['offense_coverage']}"
+            f"offense_coverage {block['offense_coverage']}, "
+            f"lineup_coverage {block['lineup_coverage']}"
         )
         if "bullpen_coverage" in block:
             coverage += f", bullpen_coverage {block['bullpen_coverage']}"

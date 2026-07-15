@@ -23,10 +23,16 @@ own archive:
   block, plus a vs-opposing-hand wOBA split selected by the as-of
   probable's handedness and shrunk toward the team's trailing-year split.
   Formulas are shared with the bulk path via app/features/offense.py.
+- lineup (§1.5, BOTH markets): per-batter as-of wOBA weighted by the real
+  batting order (lineup_woba_proj) and the top-4 vs-hand wOBA (F5-critical),
+  from the lineup PUBLISHED at as_of (event_lineups, migration 005) with an
+  honest lineup_is_confirmed flag. No archived snapshot -> the block is None
+  with is_confirmed=0; the online path never reads the realized box-score
+  order. Formulas shared with the bulk path via app/features/lineup.py.
 
 NOT implemented yet (no placeholder numbers are fabricated for them):
-- closer_available_flag (§1.4): TODO(F1.2) — needs transactions/IL ingest
-- lineup / star-out flags (§1.5): TODO(F1)
+- closer_available_flag (§1.4) and star_out_flag (§1.5): need
+  transactions/IL ingest
 - park factors (§1.6) and weather (§1.7): TODO(F1)
 - TTO decay and fastball velocity delta (§1.3): TODO(F1.1) — need
   play-by-play / Statcast sources.
@@ -51,6 +57,14 @@ from sqlalchemy import Date, Table, cast, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection
 
+from app.features.lineup import (
+    LINEUP_BATTER_WINDOW_DAYS,
+    LINEUP_FEATURE_NAMES,
+    batter_woba_asof,
+    batter_woba_vs_hand_asof,
+    weighted_lineup_woba,
+    weighted_top4_woba,
+)
 from app.features.offense import (
     OFFENSE_FEATURE_NAMES,
     OFFENSE_ROLLING_DAYS,
@@ -115,6 +129,7 @@ FEATURE_TABLES = (
     "pitching_game_logs",
     "event_probables",
     "batting_game_logs",
+    "event_lineups",
 )
 
 
@@ -492,6 +507,118 @@ def _offense_block(
     return block
 
 
+def _lineup_block(
+    conn: Connection,
+    t: dict[str, Table],
+    event_id: uuid.UUID,
+    side: str,
+    team_id: uuid.UUID,
+    event_day,
+    opp_hand: str | None,
+    as_of_ts: datetime,
+) -> dict[str, Any]:
+    """docs/04 §1.5 lineup features for one side, from the as-of published order.
+
+    The lineup is the one ARCHIVED in event_lineups with the greatest
+    first_seen_at <= as_of (production, lineup_is_confirmed=1); if none is on
+    file the block is None with is_confirmed=0 — the online path NEVER falls
+    back to the realized box-score order, which only becomes known at game
+    time (that is the bulk/backtest reconstruction, is_confirmed=0). Per-batter
+    wOBA uses the same day windows as the offense block (365 UTC days ending
+    yesterday, so a doubleheader's game 1 can never leak into game 2) and the
+    same opposing-starter-hand classification of past games. Empty windows or
+    a batter with no trailing-year line contribute None, never fabricated
+    zeros (the slot drops from the PA-share weighting).
+    """
+    block: dict[str, Any] = {name: None for name in LINEUP_FEATURE_NAMES}
+    block["lineup_is_confirmed"] = 0
+
+    lineups = t["event_lineups"]
+    latest_ts = conn.execute(
+        select(func.max(lineups.c.first_seen_at)).where(
+            lineups.c.event_id == event_id,
+            lineups.c.side == side,
+            lineups.c.first_seen_at <= as_of_ts,
+        )
+    ).scalar()
+    if latest_ts is None:
+        return block
+    slot_rows = conn.execute(
+        select(lineups.c.batting_order, lineups.c.player_id).where(
+            lineups.c.event_id == event_id,
+            lineups.c.side == side,
+            lineups.c.first_seen_at == latest_ts,
+        )
+    ).all()
+    slot_to_player = {
+        r.batting_order // 100: r.player_id
+        for r in slot_rows
+        if r.batting_order % 100 == 0
+    }
+    if not slot_to_player:
+        return block
+    block["lineup_is_confirmed"] = 1
+
+    batting, events = t["batting_game_logs"], t["events"]
+    logs, players = t["pitching_game_logs"], t["players"]
+    day = _utc_day_expr(events)
+    starter_hand = (
+        select(logs.c.event_id, logs.c.is_home, players.c.pitch_hand)
+        .select_from(logs.join(players, players.c.id == logs.c.player_id))
+        .where(logs.c.is_starter)
+        .subquery()
+    )
+    rows = conn.execute(
+        select(
+            batting.c.player_id.label("player_id"),
+            *[func.sum(batting.c[key]).label(key) for key in SUM_KEYS],
+            func.max(starter_hand.c.pitch_hand).label("opp_hand"),
+        )
+        .select_from(
+            batting.join(events, events.c.id == batting.c.event_id).outerjoin(
+                starter_hand,
+                (starter_hand.c.event_id == batting.c.event_id)
+                & (starter_hand.c.is_home != batting.c.is_home),
+            )
+        )
+        .where(
+            batting.c.player_id.in_(list(slot_to_player.values())),
+            batting.c.team_id == team_id,
+            day >= event_day - timedelta(days=LINEUP_BATTER_WINDOW_DAYS),
+            day < event_day,
+        )
+        .group_by(batting.c.player_id, batting.c.event_id)
+    ).all()
+
+    per_player: dict[uuid.UUID, list] = {}
+    for r in rows:
+        per_player.setdefault(r.player_id, []).append(r)
+
+    def _sums(subset) -> dict[str, float]:
+        return {key: float(sum(getattr(r, key) for r in subset)) for key in SUM_KEYS}
+
+    slot_to_woba = {
+        slot: batter_woba_asof(_sums(per_player.get(player, [])))
+        for slot, player in slot_to_player.items()
+    }
+    block["lineup_woba_proj"] = weighted_lineup_woba(slot_to_woba)
+
+    if opp_hand in ("L", "R"):
+        slot_to_vs_hand: dict[int, float | None] = {}
+        for slot in range(1, 5):
+            player = slot_to_player.get(slot)
+            if player is None:
+                continue
+            games = per_player.get(player, [])
+            hand_games = [r for r in games if r.opp_hand == opp_hand]
+            slot_to_vs_hand[slot] = batter_woba_vs_hand_asof(
+                _sums(hand_games), _sums(games)
+            )
+        block["top4_woba_vs_hand"] = weighted_top4_woba(slot_to_vs_hand)
+
+    return block
+
+
 def _starter_block(
     conn: Connection,
     t: dict[str, Table],
@@ -631,13 +758,16 @@ def build_features(
             ),
         }
 
-    # Offense block (§1.2), BOTH markets. Second loop on purpose: the
-    # vs-hand split is selected by the OPPOSING probable's handedness,
-    # which the starter block above already resolved as sp_is_lhp.
+    # Offense (§1.2) and lineup (§1.5) blocks, BOTH markets. Second loop on
+    # purpose: their vs-hand splits are selected by the OPPOSING probable's
+    # handedness, which the starter block above already resolved as sp_is_lhp.
     for side, team_id in (("home", event.home_team_id), ("away", event.away_team_id)):
         opp = "away" if side == "home" else "home"
         opp_hand = {1: "L", 0: "R"}.get(sides[opp].get("sp_is_lhp"))
         sides[side].update(_offense_block(conn, t, team_id, event_day, opp_hand))
+        sides[side].update(
+            _lineup_block(conn, t, event_id, side, team_id, event_day, opp_hand, as_of_ts)
+        )
 
     # Bullpen block enters the MONEYLINE vector only: leverage relievers do
     # not participate in innings 1-5, so F5 excludes it BY DESIGN — the
@@ -656,12 +786,13 @@ def build_features(
     # column, and keeping it out lets identical vectors captured at different
     # times dedupe on (event, market, feature_hash) as the schema intends.
     return {
-        "feature_version": "team_form_sp_bp_off_v4",
+        "feature_version": "team_form_sp_bp_off_lineup_v5",
         "market": market,
         "home": sides["home"],
         "away": sides["away"],
-        # TODO(F1): lineup, park, weather blocks (docs/04 §1.5-1.7),
-        # closer_available_flag (§1.4) and TTO/velocity (§1.3). Absent on
+        # TODO(F1): park, weather blocks (docs/04 §1.6-1.7),
+        # closer_available_flag and star_out_flag (§1.4-1.5, need
+        # transactions/IL ingest) and TTO/velocity (§1.3). Absent on
         # purpose — never fabricated.
     }
 

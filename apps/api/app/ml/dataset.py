@@ -36,6 +36,14 @@ import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from app.features.lineup import (
+    LINEUP_BATTER_WINDOW_DAYS,
+    LINEUP_FEATURE_NAMES,
+    batter_woba_asof,
+    batter_woba_vs_hand_asof,
+    weighted_lineup_woba,
+    weighted_top4_woba,
+)
 from app.features.offense import (
     OFFENSE_FEATURE_NAMES,
     OFFENSE_ROLLING_DAYS,
@@ -98,19 +106,23 @@ _TEAM_FORM_NAMES = (
 
 # Moneyline vector: everything. F5 excludes the bullpen block BY DESIGN —
 # leverage relievers do not participate in innings 1-5, so the features
-# are removed rather than zero-weighted (docs/04 §1.4). The offense block
-# (§1.2) enters BOTH markets.
+# are removed rather than zero-weighted (docs/04 §1.4). The offense (§1.2)
+# and lineup (§1.5) blocks enter BOTH markets; F5 leans on the lineup's
+# top4_woba_vs_hand (first turn of the order, §1.9).
 FEATURE_COLUMNS = [
     f"{side}_{name}"
     for side in ("home", "away")
     for name in (
-        *_TEAM_FORM_NAMES, *OFFENSE_FEATURE_NAMES, *SP_FEATURE_NAMES, *BP_FEATURE_NAMES
+        *_TEAM_FORM_NAMES, *OFFENSE_FEATURE_NAMES, *LINEUP_FEATURE_NAMES,
+        *SP_FEATURE_NAMES, *BP_FEATURE_NAMES
     )
 ]
 F5_FEATURE_COLUMNS = [
     f"{side}_{name}"
     for side in ("home", "away")
-    for name in (*_TEAM_FORM_NAMES, *OFFENSE_FEATURE_NAMES, *SP_FEATURE_NAMES)
+    for name in (
+        *_TEAM_FORM_NAMES, *OFFENSE_FEATURE_NAMES, *LINEUP_FEATURE_NAMES, *SP_FEATURE_NAMES
+    )
 ]
 
 
@@ -239,6 +251,56 @@ def load_batting_frame(engine: Engine, sport: str = "mlb") -> pd.DataFrame:
     §1.2 — NULL when that side has no starter row or an unknown hand)."""
     with engine.connect() as conn:
         df = pd.read_sql(text(_BATTING_SQL), conn, params={"sport": sport})
+    df["start_time_utc"] = pd.to_datetime(df["start_time_utc"], utc=True)
+    return df
+
+
+# Per-PLAYER batting rows (NOT aggregated to team): the lineup block (§1.5)
+# needs each batter's own as-of wOBA and the realized batting_order. Same
+# opposing-starter-hand proxy as _BATTING_SQL. (event_id, player_id) is the
+# PK, so grouping by it plus the passthrough columns collapses the LEFT JOIN
+# to one opposing-starter hand per row without touching the sums.
+_LINEUP_SQL = """
+SELECT b.event_id,
+       b.team_id,
+       b.is_home,
+       b.player_id,
+       b.batting_order,
+       e.start_time_utc,
+       sum(b.at_bats) AS at_bats,
+       sum(b.hits) AS hits,
+       sum(b.doubles) AS doubles,
+       sum(b.triples) AS triples,
+       sum(b.home_runs) AS home_runs,
+       sum(b.walks) AS walks,
+       sum(b.intentional_walks) AS intentional_walks,
+       sum(b.strikeouts) AS strikeouts,
+       sum(b.hit_by_pitch) AS hit_by_pitch,
+       sum(b.sac_flies) AS sac_flies,
+       sum(b.sac_bunts) AS sac_bunts,
+       max(ph.pitch_hand) AS opp_starter_hand
+FROM batting_game_logs b
+JOIN events e ON e.id = b.event_id
+JOIN sports s ON s.id = e.sport_id
+LEFT JOIN (
+    SELECT l.event_id, l.is_home, p.pitch_hand
+    FROM pitching_game_logs l
+    JOIN players p ON p.id = l.player_id
+    WHERE l.is_starter
+) ph ON ph.event_id = b.event_id AND ph.is_home <> b.is_home
+WHERE s.key = :sport
+GROUP BY b.event_id, b.team_id, b.is_home, b.player_id, b.batting_order, e.start_time_utc
+ORDER BY e.start_time_utc
+"""
+
+
+def load_lineup_frame(engine: Engine, sport: str = "mlb") -> pd.DataFrame:
+    """One row per (game, batter): per-player batting sums, batting_order and
+    the ACTUAL opposing starter's hand (docs/04 §1.5). batting_order rides
+    the realized box score — the backtest reconstruction of the lineup that
+    actually played (is_confirmed=false), never a pre-game archived order."""
+    with engine.connect() as conn:
+        df = pd.read_sql(text(_LINEUP_SQL), conn, params={"sport": sport})
     df["start_time_utc"] = pd.to_datetime(df["start_time_utc"], utc=True)
     return df
 
@@ -735,6 +797,136 @@ def _merge_offense_features(
     )
 
 
+def _lineup_features(
+    lineup: pd.DataFrame, games: pd.DataFrame, opp_hand: dict
+) -> pd.DataFrame:
+    """Per-game lineup block (bulk twin of builder._lineup_block).
+
+    Composition (who bats in which slot) is the REALIZED box-score order
+    (batting_order % 100 == 0): no pre-pipeline lineup snapshots exist, so
+    lineup_is_confirmed is 0 for every training row — a documented optimistic
+    bias (§1.5, like the probable-vs-actual gap of §1.3). The wOBA VALUES are
+    strictly prior: each batter's 365d window ends yesterday (day < game day),
+    keyed by (player, team) to mirror the online builder's team_id filter,
+    feeding the SAME shared formulas (app/features/lineup.py). A slot whose
+    batter has no trailing-year line drops from the PA-share weighting.
+    """
+    lt = lineup.sort_values("start_time_utc").reset_index(drop=True)
+    days = _utc_epoch_days(lt["start_time_utc"])
+    raw = {k: lt[k].to_numpy(dtype=float) for k in SUM_KEYS}
+    hand_col = lt["opp_starter_hand"].to_numpy(dtype=object)
+
+    def _cum(a: np.ndarray) -> np.ndarray:
+        return np.concatenate([[0.0], np.cumsum(a)])
+
+    # Per (player, team) cumulative arrays: a traded batter's games with his
+    # other team must not enter this team's window (the online builder filters
+    # batting.team_id == team_id).
+    players: dict = {}
+    for (pid, tid), group in lt.groupby(["player_id", "team_id"], sort=False):
+        pos = group.index.to_numpy()
+        entry: dict = {"days": days[pos]}
+        for key in SUM_KEYS:
+            entry[key] = _cum(raw[key][pos])
+            for hand in ("L", "R"):
+                mask = (hand_col[pos] == hand).astype(float)
+                entry[f"{hand}_{key}"] = _cum(raw[key][pos] * mask)
+        players[(pid, tid)] = entry
+
+    # Realized lineup composition per (event_id, is_home): slot -> player.
+    composition: dict = {}
+    bo = lt["batting_order"].to_numpy(dtype=object)
+    ev = lt["event_id"].to_numpy(dtype=object)
+    ih = lt["is_home"].to_numpy(dtype=object)
+    pl = lt["player_id"].to_numpy(dtype=object)
+    for i in range(len(lt)):
+        order = bo[i]
+        if order is None or (isinstance(order, float) and np.isnan(order)):
+            continue
+        order = int(order)
+        if order < 100 or order % 100 != 0:
+            continue  # subs (101, 201, ...) and junk are not starters
+        composition.setdefault((ev[i], bool(ih[i])), {})[order // 100] = pl[i]
+
+    game_days = _utc_epoch_days(games["start_time_utc"])
+    event_ids = games["event_id"].to_numpy(dtype=object)
+    team_cols = {
+        "home": games["home_team_id"].to_numpy(dtype=object),
+        "away": games["away_team_id"].to_numpy(dtype=object),
+    }
+    out = {
+        f"{side}_{name}": np.full(len(games), np.nan)
+        for side in ("home", "away")
+        for name in LINEUP_FEATURE_NAMES
+    }
+    # is_confirmed is a concrete flag (always 0 in backtest), never NaN.
+    for side in ("home", "away"):
+        out[f"{side}_lineup_is_confirmed"] = np.zeros(len(games))
+
+    def _window_sums(entry: dict, lo: int, hi: int, prefix: str = "") -> dict:
+        return {
+            key: entry[f"{prefix}{key}"][hi] - entry[f"{prefix}{key}"][lo]
+            for key in SUM_KEYS
+        }
+
+    for i in range(len(games)):
+        day = int(game_days[i])
+        for side in ("home", "away"):
+            comp = composition.get((event_ids[i], side == "home"))
+            if not comp:
+                continue  # no realized lineup for this side: proj/top4 NaN
+            team_id = team_cols[side][i]
+            hand = opp_hand.get((event_ids[i], side))
+            slot_to_woba: dict = {}
+            slot_to_vs_hand: dict = {}
+            for slot, player in comp.items():
+                entry = players.get((player, team_id))
+                if entry is None:
+                    slot_to_woba[slot] = None
+                    continue
+                d = entry["days"]
+                hi = int(np.searchsorted(d, day, side="left"))
+                lo = int(
+                    np.searchsorted(d, day - LINEUP_BATTER_WINDOW_DAYS, side="left")
+                )
+                slot_to_woba[slot] = batter_woba_asof(_window_sums(entry, lo, hi))
+                if hand in ("L", "R") and slot <= 4:
+                    slot_to_vs_hand[slot] = batter_woba_vs_hand_asof(
+                        _window_sums(entry, lo, hi, prefix=f"{hand}_"),
+                        _window_sums(entry, lo, hi),
+                    )
+            proj = weighted_lineup_woba(slot_to_woba)
+            if proj is not None:
+                out[f"{side}_lineup_woba_proj"][i] = proj
+            if hand in ("L", "R"):
+                top4 = weighted_top4_woba(slot_to_vs_hand)
+                if top4 is not None:
+                    out[f"{side}_top4_woba_vs_hand"][i] = top4
+
+    features = pd.DataFrame(out)
+    features["event_id"] = games["event_id"].to_numpy()
+    return features
+
+
+def _merge_lineup_features(
+    frame: pd.DataFrame,
+    lineup: pd.DataFrame | None,
+    games: pd.DataFrame,
+    opp_hand: dict,
+) -> pd.DataFrame:
+    """Attach the lineup columns; NaN block (is_confirmed=0) with no data."""
+    if lineup is None or len(lineup) == 0:
+        for side in ("home", "away"):
+            for name in LINEUP_FEATURE_NAMES:
+                frame[f"{side}_{name}"] = (
+                    0.0 if name == "lineup_is_confirmed" else np.nan
+                )
+        return frame
+    return frame.merge(
+        _lineup_features(lineup, games, opp_hand), on="event_id", how="left"
+    )
+
+
 def _merge_bullpen_features(
     frame: pd.DataFrame, bullpen: pd.DataFrame | None, games: pd.DataFrame
 ) -> pd.DataFrame:
@@ -777,6 +969,7 @@ def build_training_frame(
     pitching: pd.DataFrame | None = None,
     bullpen: pd.DataFrame | None = None,
     batting: pd.DataFrame | None = None,
+    lineup: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Game rows with home_/away_ features, target and season.
 
@@ -785,15 +978,17 @@ def build_training_frame(
     market='f5_moneyline': target = home led after 5 innings; F5 ties (push)
     and games without F5 partials are dropped — a push is not a loss and
     teaching the model otherwise would poison it. The F5 vector EXCLUDES
-    the bullpen block by design (docs/04 §1.4); the offense block (§1.2)
-    enters both markets.
+    the bullpen block by design (docs/04 §1.4); the offense (§1.2) and
+    lineup (§1.5) blocks enter both markets.
 
-    ``pitching``/``bullpen``/``batting`` are the loaders' outputs; without
-    them the corresponding columns are NaN (the models impute, the report
-    says so — never silently fabricated). The offense split's selected
-    hand comes from the pitching frame (actual starters): without pitching
-    the split column is NaN even when batting exists, mirroring the online
-    builder without a known probable.
+    ``pitching``/``bullpen``/``batting``/``lineup`` are the loaders' outputs;
+    without them the corresponding columns are NaN (the models impute, the
+    report says so — never silently fabricated), except lineup_is_confirmed
+    which is a concrete 0 (the backtest never has an archived pre-game
+    lineup, §1.5). The offense and lineup vs-hand splits are selected by the
+    pitching frame (actual starters): without pitching those split columns
+    are NaN even when batting exists, mirroring the online builder without a
+    known probable.
     """
     if market not in ("moneyline", "f5_moneyline"):
         raise ValueError(f"unknown market {market!r}")
@@ -814,7 +1009,9 @@ def build_training_frame(
         right_on=["away_event_id", "away_team_id"],
     )
     frame = _merge_starter_features(frame, pitching)
-    frame = _merge_offense_features(frame, batting, games, _opp_hand_map(pitching))
+    opp_hand = _opp_hand_map(pitching)
+    frame = _merge_offense_features(frame, batting, games, opp_hand)
+    frame = _merge_lineup_features(frame, lineup, games, opp_hand)
     if market == "moneyline":
         frame = _merge_bullpen_features(frame, bullpen, games)
 

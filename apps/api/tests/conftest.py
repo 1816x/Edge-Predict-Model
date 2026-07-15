@@ -94,12 +94,12 @@ def seeded(db):
             pitches_thrown=pitches,
         )
 
-    def _bat(pid, is_home, ab, h, d2, d3, hr, bb, ibb, so, hbp, sf, sh):
+    def _bat(pid, is_home, ab, h, d2, d3, hr, bb, ibb, so, hbp, sf, sh, order=None):
         return BattingLine(
             mlb_person_id=pid, full_name=f"B{pid}", is_home=is_home,
             at_bats=ab, hits=h, doubles=d2, triples=d3, home_runs=hr,
             walks=bb, intentional_walks=ibb, strikeouts=so, hit_by_pitch=hbp,
-            sac_flies=sf, sac_bunts=sh, batting_order=None,
+            sac_flies=sf, sac_bunts=sh, batting_order=order,
             plate_appearances=None,
         )
 
@@ -108,7 +108,7 @@ def seeded(db):
         (
             "sports", "teams", "events", "event_results", "feature_snapshots",
             "players", "pitching_game_logs", "event_probables",
-            "batting_game_logs",
+            "batting_game_logs", "event_lineups",
         ),
     )
     ts = lambda m, d, h: datetime(2026, m, d, h, 0, tzinfo=timezone.utc)  # noqa: E731
@@ -241,16 +241,35 @@ def seeded(db):
             ],
             player_cache,
         )
+        # The July 6th target of the parity test carries a REALIZED lineup:
+        # batting_order is set on X's XB1 (home leadoff) and H's HB2 (away
+        # leadoff). Setting the audit column does not touch the offense block
+        # (which never reads batting_order), so the §1.2 hand-computed tests
+        # for the July 8th target are unaffected. event_lineups below archives
+        # the SAME order as-of, so the online builder (is_confirmed=1) and the
+        # bulk reconstruction (is_confirmed=0, box-score order) agree on
+        # lineup_woba_proj/top4_woba_vs_hand.
         store.bulk_upsert_batting_logs(
             conn, tables, e900002, teams[X], teams[H],
             [
-                _bat(XB1, True, 4, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0),
-                _bat(HB2, False, 4, 2, 2, 0, 0, 1, 0, 1, 0, 0, 0),
+                _bat(XB1, True, 4, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0, order=100),
+                _bat(HB2, False, 4, 2, 2, 0, 0, 1, 0, 1, 0, 0, 0, order=100),
             ],
             player_cache,
         )
         store.bulk_upsert_batting_logs(
             conn, tables, e900004, teams[H], teams[X],
             [_bat(HB1, True, 4, 3, 0, 0, 2, 0, 0, 0, 0, 0, 0)], player_cache,
+        )
+        # Archived pre-game lineup for the July 6th game (docs/04 §1.5),
+        # first seen before as_of and matching the box-score batting_order:
+        # the online lineup block resolves is_confirmed=1 from here.
+        store.record_lineup(
+            conn, tables, e900002, "home",
+            [(100, player_cache[XB1])], ts(7, 6, 12),
+        )
+        store.record_lineup(
+            conn, tables, e900002, "away",
+            [(100, player_cache[HB2])], ts(7, 6, 12),
         )
     return db, tables, target_id
