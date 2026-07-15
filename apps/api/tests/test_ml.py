@@ -93,7 +93,6 @@ class TestWalkForward:
             # With real team-strength signal, a learned model must beat the
             # constant-0.5 baseline on log loss.
             assert rep["hist_gb"]["calibrated"]["log_loss"] < rep["baseline_constant"]["log_loss"]
-            assert rep["logistic"]["calibrated"]["log_loss"] < rep["baseline_constant"]["log_loss"]
             assert rep["logistic_scaled"]["calibrated"]["log_loss"] < rep["baseline_constant"]["log_loss"]
 
     def test_f5_market_drops_pushes(self):
@@ -590,7 +589,7 @@ class TestMarketPriorSubset:
         # A constant-0.5 prior scores ln(2) on any outcome mix.
         assert sub["market_prior"]["log_loss"] == pytest.approx(0.69315, abs=1e-4)
         # Models are ALSO scored on those same 50 rows, never the full season.
-        assert sub["logistic_calibrated"]["n"] == 50
+        assert sub["logistic_scaled_calibrated"]["n"] == 50
 
         empty = report["seasons"][2023]["market_prior_subset"]
         assert empty["n"] == 0
@@ -608,7 +607,7 @@ class TestMarketPriorSubset:
         # Against a coin-flip prior the learned models must win (same claim
         # the baseline_constant assertion makes on the full season).
         assert sub["gate"]["beaten_by"] == {
-            "logistic": True, "logistic_scaled": True, "hist_gb": True,
+            "logistic_scaled": True, "hist_gb": True,
         }
 
         import json
@@ -617,11 +616,11 @@ class TestMarketPriorSubset:
 
 
 def test_markdown_summary_renders_every_model_column():
-    """_markdown_summary hardcodes per-model keys (logistic, logistic_scaled,
-    hist_gb) in the season and prior tables and is otherwise only executed
-    by __main__ in production: without this test, renaming or dropping a
-    model keeps the suite green and kills the Actions run at the finish
-    line (the int32 json.dumps incident, same shape). Renders BOTH tables."""
+    """_markdown_summary hardcodes per-model keys (logistic_scaled, hist_gb)
+    in the season and prior tables and is otherwise only executed by __main__
+    in production: without this test, renaming or dropping a model keeps the
+    suite green and kills the Actions run at the finish line (the int32
+    json.dumps incident, same shape). Renders BOTH tables."""
     from app.jobs import train_f1
 
     frame = ds.build_training_frame(_synthetic_games(), "moneyline")

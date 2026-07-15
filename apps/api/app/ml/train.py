@@ -169,13 +169,12 @@ def walk_forward_report(
         }
 
         models = {
-            "logistic": LogisticRegression(max_iter=2000, C=1.0),
             # docs/04 §2.2 mandates standardized features for the logistic;
             # the Pipeline fits the scaler on THIS fold's train only (never
-            # the full dataset — that would leak future means/variances).
-            # The unscaled twin stays for ONE more tanda as the attribution
-            # witness vs the pre-offense baseline (run #37); drop it once
-            # the F1.2 measurement is recorded in PLAN.md.
+            # the full dataset — that would leak future means/variances). The
+            # unscaled twin was retired after v5 (F1.3): logistic_scaled
+            # matches or beats it and converges, so the ConvergenceWarning is
+            # gone (its attribution job vs the pre-offense baseline is done).
             "logistic_scaled": make_pipeline(
                 StandardScaler(), LogisticRegression(max_iter=2000, C=1.0)
             ),

@@ -197,14 +197,13 @@ def _markdown_summary(result: dict[str, Any]) -> str:
             f"{coverage}"
         )
         lines.append("")
-        lines.append("| Test | n | const LL | home_rate LL | logistic LL | log_scaled LL | hist_gb LL | log_scaled ECE | hist_gb ECE |")
-        lines.append("|---|---|---|---|---|---|---|---|---|")
+        lines.append("| Test | n | const LL | home_rate LL | log_scaled LL | hist_gb LL | log_scaled ECE | hist_gb ECE |")
+        lines.append("|---|---|---|---|---|---|---|---|")
         for season, rep in sorted(block["report"]["seasons"].items()):
             lines.append(
-                f"| {season} | {rep['logistic']['calibrated']['n']} "
+                f"| {season} | {rep['logistic_scaled']['calibrated']['n']} "
                 f"| {rep['baseline_constant']['log_loss']} "
                 f"| {rep['baseline_home_rate']['log_loss']} "
-                f"| {rep['logistic']['calibrated']['log_loss']} "
                 f"| {rep['logistic_scaled']['calibrated']['log_loss']} "
                 f"| {rep['hist_gb']['calibrated']['log_loss']} "
                 f"| {rep['logistic_scaled']['calibrated']['ece']} "
@@ -221,8 +220,8 @@ def _markdown_summary(result: dict[str, Any]) -> str:
                 "Subconjunto con market prior archivado (mismas filas para prior y modelos):"
             )
             lines.append("")
-            lines.append("| Test | n_prior | prior LL | logistic LL | log_scaled LL | hist_gb LL | gate |")
-            lines.append("|---|---|---|---|---|---|---|")
+            lines.append("| Test | n_prior | prior LL | log_scaled LL | hist_gb LL | gate |")
+            lines.append("|---|---|---|---|---|---|")
             for season, sub in prior_rows:
                 gate = sub.get("gate", {})
                 verdict = (
@@ -233,7 +232,6 @@ def _markdown_summary(result: dict[str, Any]) -> str:
                 lines.append(
                     f"| {season} | {sub['n']} "
                     f"| {sub['market_prior']['log_loss']} "
-                    f"| {sub['logistic_calibrated']['log_loss']} "
                     f"| {sub['logistic_scaled_calibrated']['log_loss']} "
                     f"| {sub['hist_gb_calibrated']['log_loss']} "
                     f"| {verdict} |"
