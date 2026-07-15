@@ -57,6 +57,11 @@ PITCHING_TABLES = (
 # skips the batting half (with a note), never the whole run.
 BATTING_TABLE = "batting_game_logs"
 
+# Migration 005 table, reflected separately (same degradation contract):
+# pre-005 the lineup-archive job skips with a note while the rest of the
+# pre-game crons keep running.
+LINEUP_TABLE = "event_lineups"
+
 EVENT_MATCH_WINDOW = timedelta(hours=3)
 
 
@@ -638,6 +643,63 @@ def record_probables(
         return 0
     conn.execute(probables.insert().values(to_insert))
     return len(to_insert)
+
+
+def record_lineup(
+    conn: Connection,
+    t: dict[str, Table],
+    event_id: uuid.UUID,
+    side: str,
+    ordered_pairs: list[tuple[int, uuid.UUID]],
+    first_seen_at: datetime,
+) -> int:
+    """Append a lineup snapshot iff it DIFFERS from the latest recorded one.
+
+    ``ordered_pairs`` is the published starting lineup as (batting_order,
+    player_id), one entry per slot. A "snapshot" is the set of rows sharing
+    one first_seen_at for (event, side); we insert ALL rows only when the
+    (slot, player) set differs from the most recent snapshot — dedupe in the
+    store layer, same reasoning as ``record_probables`` (a re-announced
+    lineup must be recordable, so no unique constraint forbids it). Re-running
+    the same slate with an unchanged lineup inserts nothing. Returns how many
+    rows were inserted (0 or len(ordered_pairs)).
+    """
+    if not ordered_pairs:
+        return 0
+    lineups = t["event_lineups"]
+    existing = conn.execute(
+        select(
+            lineups.c.batting_order,
+            lineups.c.player_id,
+            lineups.c.first_seen_at,
+        )
+        .where(lineups.c.event_id == event_id, lineups.c.side == side)
+        .order_by(lineups.c.first_seen_at.desc())
+    ).all()
+    if existing:
+        latest_ts = existing[0].first_seen_at
+        latest = {
+            (r.batting_order, r.player_id)
+            for r in existing
+            if r.first_seen_at == latest_ts
+        }
+        if latest == {(order, pid) for order, pid in ordered_pairs}:
+            return 0
+    conn.execute(
+        lineups.insert().values(
+            [
+                {
+                    "event_id": event_id,
+                    "side": side,
+                    "batting_order": order,
+                    "player_id": pid,
+                    "first_seen_at": first_seen_at,
+                }
+                for order, pid in ordered_pairs
+            ]
+        )
+    )
+    return len(ordered_pairs)
 
 
 def insert_odds_snapshots(

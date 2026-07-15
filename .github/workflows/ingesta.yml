@@ -54,6 +54,7 @@ on:
         default: snapshot_odds
         options:
           - sync_schedule
+          - sync_lineups
           - snapshot_odds
           - snapshot_odds_closing
           - backfill_results
@@ -116,6 +117,7 @@ jobs:
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             case "$INPUT_JOB" in
               sync_schedule)         python -m app.jobs.sync_schedule $INPUT_ARGS ;;
+              sync_lineups)          python -m app.jobs.sync_lineups $INPUT_ARGS ;;
               snapshot_odds)         python -m app.jobs.snapshot_odds $INPUT_ARGS ;;
               snapshot_odds_closing) python -m app.jobs.snapshot_odds --closing-window-min 30 $INPUT_ARGS ;;
               backfill_results)      python -m app.jobs.backfill_results $INPUT_ARGS ;;
@@ -136,6 +138,7 @@ jobs:
             YDAY=$(date -u -d "yesterday" +%F)
             START=$(date -u -d "3 days ago" +%F)
             python -m app.jobs.sync_schedule
+            python -m app.jobs.sync_lineups
             python -m app.jobs.snapshot_odds
             python -m app.jobs.backfill_results --start-date "$START" --end-date "$YDAY"
             python -m app.jobs.backfill_pitching --start-date "$START" --end-date "$YDAY"
@@ -146,7 +149,10 @@ jobs:
             # Antes de cada snapshot, refrescar slate y probables (1 llamada
             # MLB gratis): auto-repara el slate si el cron diario se saltó y
             # archiva los cambios de probable intradía (scratches) — justo
-            # los eventos donde la línea más se mueve.
+            # los eventos donde la línea más se mueve. sync_lineups archiva el
+            # lineup publicado as-of (bloque §1.5): en esta cadencia pre-juego
+            # captura los lineups conforme se publican (~1-4h antes).
             python -m app.jobs.sync_schedule
+            python -m app.jobs.sync_lineups
             python -m app.jobs.snapshot_odds
           fi
