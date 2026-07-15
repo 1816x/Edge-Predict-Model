@@ -277,6 +277,86 @@ def test_sync_schedule_archives_probable_history(db):
 
 
 @pytest.mark.integration
+def test_sync_lineups_archives_records_on_change_and_respects_as_of(db):
+    from app.jobs import sync_lineups
+
+    _seed_events(db, [910010], date_iso="2026-07-08")
+    client = FakeMlbClient([_schedule_game(910010, "2026-07-08")])
+    # now BEFORE the 23:10Z start and inside the lookahead window: pre-game.
+    before = datetime(2026, 7, 8, 20, 0, tzinfo=timezone.utc)
+
+    first = sync_lineups.run(
+        "2026-07-08", client=client, engine=db, now=before, sleep_seconds=0.0
+    )
+    # Fixture posts 2 home + 3 away starters (multiples of 100); both sides
+    # archived, one snapshot each.
+    assert first["games_in_window"] == 1
+    assert first["sides_posted"] == 2
+    assert first["snapshots_new"] == 2
+    with db.connect() as conn:
+        rows = conn.execute(
+            text("SELECT side, batting_order FROM event_lineups ORDER BY side, batting_order")
+        ).all()
+    assert [(r.side, r.batting_order) for r in rows] == [
+        ("away", 100), ("away", 600), ("away", 900),
+        ("home", 100), ("home", 200),
+    ]
+
+    # Same posted lineup again: nothing new (store-layer dedupe).
+    second = sync_lineups.run(
+        "2026-07-08", client=client, engine=db, now=before, sleep_seconds=0.0
+    )
+    assert second["snapshots_new"] == 0
+
+    # A lineup change (swap the home leadoff): ONE new snapshot, the old one
+    # stays audited.
+    client.get_boxscore = lambda pk: _boxscore_with_home_leadoff(999999)
+    third = sync_lineups.run(
+        "2026-07-08", client=client, engine=db, now=before, sleep_seconds=0.0
+    )
+    assert third["snapshots_new"] == 1
+
+    # As-of safety: a game already started is NEVER archived.
+    after = datetime(2026, 7, 8, 23, 30, tzinfo=timezone.utc)
+    started = sync_lineups.run(
+        "2026-07-08", client=client, engine=db, now=after, sleep_seconds=0.0
+    )
+    assert started["games_in_window"] == 0
+    assert started["boxscores_fetched"] == 0
+
+
+def _boxscore_with_home_leadoff(person_id: int) -> dict:
+    """The fixture boxscore with the home leadoff slot reassigned."""
+    box = load_fixture("mlb_boxscore.json")
+    box["teams"]["home"]["players"]["ID700011"]["person"]["id"] = person_id
+    box["teams"]["home"]["players"]["ID700011"]["person"]["fullName"] = "New Leadoff"
+    return box
+
+
+@pytest.mark.integration
+def test_sync_lineups_survives_a_boxscore_error(db):
+    """A single game's boxscore error must NOT crash the job: it is chained
+    under `set -e` before the irreplaceable odds snapshot, so a transient MLB
+    error becomes a summary anomaly, never an abort."""
+    from app.ingestion.mlb_client import MlbApiError
+    from app.jobs import sync_lineups
+
+    _seed_events(db, [910010], date_iso="2026-07-08")
+    client = FakeMlbClient([_schedule_game(910010, "2026-07-08")])
+
+    def _boom(pk):
+        raise MlbApiError("500 boom")
+
+    client.get_boxscore = _boom
+    before = datetime(2026, 7, 8, 20, 0, tzinfo=timezone.utc)
+    result = sync_lineups.run(
+        "2026-07-08", client=client, engine=db, now=before, sleep_seconds=0.0
+    )
+    assert result["boxscore_errors"] == 1
+    assert result["snapshots_new"] == 0  # nothing archived, but no crash
+
+
+@pytest.mark.integration
 def test_placeholder_name_never_clobbers_real_name(db):
     from app.ingestion import store
 
@@ -365,6 +445,22 @@ def test_migration_004_is_idempotent(db):
     # 1 tabla + 2 índices + 1 drop trigger + 1 create trigger (BEGIN/COMMIT
     # los salta el splitter).
     assert first["statements"] == second["statements"] == 5
+
+
+@pytest.mark.integration
+def test_migration_005_is_idempotent(db):
+    """Through the REAL apply_migration splitter: a ';' inside any comment
+    would split it mid-line and break the statement count (the migration-003
+    bug this guards against)."""
+    from pathlib import Path
+
+    from app.jobs import apply_migration
+
+    migration = Path(__file__).parents[3] / "infra" / "migrations" / "005-event-lineups.sql"
+    first = apply_migration.run(str(migration), engine=db)
+    second = apply_migration.run(str(migration), engine=db)
+    # 1 tabla + 1 índice (BEGIN/COMMIT los salta el splitter).
+    assert first["statements"] == second["statements"] == 2
 
 
 def test_backfill_pitching_rejects_inverted_range():

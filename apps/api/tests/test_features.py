@@ -99,7 +99,7 @@ def test_starter_block_hand_computed_values(seeded):
     )
     assert away["bullpen_ip_expected"] == 5.0  # SP2: 15 outs in his one start
 
-    assert features["feature_version"] == "team_form_sp_bp_off_v4"
+    assert features["feature_version"] == "team_form_sp_bp_off_lineup_v5"
 
 
 def test_offense_block_hand_computed_values(seeded):
@@ -221,6 +221,20 @@ def test_starter_block_none_without_probable(seeded):
     assert features["home"]["team_woba_season"] == round(12.139 / 22, 4)
     for name in builder.OFFENSE_FEATURE_NAMES:
         assert features["away"][name] is None, name
+
+
+def test_lineup_block_none_without_archived_snapshot(seeded):
+    """The July 8th target has no event_lineups snapshot: the online block is
+    honestly is_confirmed=0 with None wOBA features (never the realized
+    box-score order — that would leak), in BOTH markets."""
+    db, tables, target_id = seeded
+    with db.connect() as conn:
+        for market in ("moneyline", "f5_moneyline"):
+            features = builder.build_features(conn, tables, target_id, market, AS_OF)
+            for side in ("home", "away"):
+                assert features[side]["lineup_is_confirmed"] == 0, (market, side)
+                assert features[side]["lineup_woba_proj"] is None, (market, side)
+                assert features[side]["top4_woba_vs_hand"] is None, (market, side)
 
 
 def test_future_game_never_leaks(seeded):

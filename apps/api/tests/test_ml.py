@@ -7,6 +7,7 @@ import pytest
 np = pytest.importorskip("numpy")
 pd = pytest.importorskip("pandas")
 
+from app.features import lineup as lu  # noqa: E402
 from app.ml import dataset as ds  # noqa: E402  (after importorskip)
 from app.ml import train as tr  # noqa: E402
 
@@ -278,8 +279,11 @@ class TestBullpenFeatures:
         # The offense block (docs/04 §1.2) enters BOTH vectors: 7 per side.
         assert sum("team_woba" in c or "team_ops" in c or "team_iso" in c
                    or "team_k_pct" in c or "team_bb_pct" in c for c in f5.columns) == 14
-        assert len(ds.FEATURE_COLUMNS) == 54
-        assert len(ds.F5_FEATURE_COLUMNS) == 46
+        # The lineup block (docs/04 §1.5) also enters BOTH vectors: 3 per side.
+        assert sum("lineup" in c or "top4" in c for c in ml.columns) == 6
+        assert sum("lineup" in c or "top4" in c for c in f5.columns) == 6
+        assert len(ds.FEATURE_COLUMNS) == 60
+        assert len(ds.F5_FEATURE_COLUMNS) == 52
         assert ds.feature_columns("f5_moneyline") == ds.F5_FEATURE_COLUMNS
 
 
@@ -387,6 +391,181 @@ class TestOffenseFeatures:
         assert sorted(report["seasons"]) == [2022, 2023]
 
 
+def _sums(ab, h, d2, d3, hr, bb, ibb, so, hbp, sf, sh):
+    """A batter's counting sums dict (the argument the lineup math takes)."""
+    return dict(
+        at_bats=ab, hits=h, doubles=d2, triples=d3, home_runs=hr, walks=bb,
+        intentional_walks=ibb, strikeouts=so, hit_by_pitch=hbp,
+        sac_flies=sf, sac_bunts=sh,
+    )
+
+
+class TestLineupMath:
+    """Hand-computed lineup math with the frozen 2017 weights and priors
+    (PRIOR wOBA 0.320, batter shrink 100 PA, split shrink 50 PA, PA-share
+    slot weights). No DB — the pure formulas both paths share."""
+
+    def test_batter_woba_shrinks_toward_prior(self):
+        # 4 singles in 10 AB + 2 uBB: num = .877*4 + .693*2 = 4.894, den =
+        # 10 + 2 = 12. shrunk = (4.894 + 100*0.320)/(12 + 100) = 0.3294.
+        s = _sums(10, 4, 0, 0, 0, 2, 0, 0, 0, 0, 0)
+        assert lu.batter_woba_asof(s) == pytest.approx(round(36.894 / 112, 4))
+
+    def test_batter_without_pa_is_dropped_not_shrunk(self):
+        # No plate appearances -> None. The league prior is NEVER injected as
+        # if it were this batter's line (that would fabricate a hitter).
+        assert lu.batter_woba_asof(_sums(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)) is None
+
+    def test_weighted_lineup_renormalizes_over_present_slots(self):
+        # Slot 2 has no usable wOBA: weight over slots 1 and 3 only.
+        # (0.1216*0.400 + 0.1163*0.200)/(0.1216 + 0.1163) = 0.3022.
+        got = lu.weighted_lineup_woba({1: 0.400, 2: None, 3: 0.200})
+        expected = (0.1216 * 0.400 + 0.1163 * 0.200) / (0.1216 + 0.1163)
+        assert got == pytest.approx(round(expected, 4))
+
+    def test_weighted_lineup_none_when_no_usable_slot(self):
+        assert lu.weighted_lineup_woba({1: None, 2: None}) is None
+
+    def test_vs_hand_shrinks_toward_own_overall(self):
+        # Overall: 6 singles/20 AB -> target 5.262/20 = 0.2631. Same-hand: 2
+        # singles/5 AB -> num 1.754, den 5. (1.754 + 50*0.2631)/(5 + 50).
+        overall = _sums(20, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        hand = _sums(5, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        expected = (1.754 + 50 * (5.262 / 20)) / 55
+        assert lu.batter_woba_vs_hand_asof(hand, overall) == pytest.approx(
+            round(expected, 4)
+        )
+
+    def test_vs_hand_empty_split_is_pure_prior(self):
+        # Never faced this hand: value is the batter's own overall wOBA.
+        overall = _sums(20, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        empty = _sums(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        assert lu.batter_woba_vs_hand_asof(empty, overall) == pytest.approx(
+            round(5.262 / 20, 4)
+        )
+
+    def test_vs_hand_none_without_overall_sample(self):
+        empty = _sums(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        assert lu.batter_woba_vs_hand_asof(empty, empty) is None
+
+
+def _lineup_row(eid, day, pid, is_home, order, hand, ab, h, bb):
+    """A per-batter lineup row (singles-only line keeps the wOBA math easy)."""
+    return dict(
+        event_id=eid, team_id="T1", is_home=is_home, player_id=pid,
+        batting_order=order,
+        start_time_utc=datetime(*day, 23, 0, tzinfo=timezone.utc),
+        at_bats=ab, hits=h, doubles=0, triples=0, home_runs=0, walks=bb,
+        intentional_walks=0, strikeouts=0, hit_by_pitch=0, sac_flies=0,
+        sac_bunts=0, opp_starter_hand=hand,
+    )
+
+
+def _lineup_frames():
+    """T1 (home) bats p1@1, p2@2, p3@3 in target g1 (2024-04-20 vs a righty).
+    p1 and p2 have one prior game each (in the 365d window); p3 has none, so
+    its slot drops. Opposing hand R selects the vs-hand split.
+    """
+    lineup = pd.DataFrame(
+        [
+            _lineup_row("h1", (2024, 4, 10), "p1", True, None, "R", 10, 4, 0),
+            _lineup_row("h2", (2024, 4, 11), "p2", True, None, "R", 9, 3, 0),
+            _lineup_row("g1", (2024, 4, 20), "p1", True, 100, "R", 3, 1, 0),
+            _lineup_row("g1", (2024, 4, 20), "p2", True, 200, "R", 3, 1, 0),
+            _lineup_row("g1", (2024, 4, 20), "p3", True, 300, "R", 3, 1, 0),
+        ]
+    )
+    lineup["start_time_utc"] = pd.to_datetime(lineup["start_time_utc"], utc=True)
+    games = pd.DataFrame(
+        [dict(event_id="g1", home_team_id="T1", away_team_id="T2",
+              start_time_utc=datetime(2024, 4, 20, 20, 0, tzinfo=timezone.utc))]
+    )
+    games["start_time_utc"] = pd.to_datetime(games["start_time_utc"], utc=True)
+    return lineup, games
+
+
+class TestLineupFeatures:
+    """Bulk lineup block (docs/04 §1.5): composition from the realized box
+    score (is_confirmed=0), wOBA strictly prior, weighted by PA-share."""
+
+    def _row(self, opp_hand=None):
+        lineup, games = _lineup_frames()
+        hand = {("g1", "home"): "R"} if opp_hand is None else opp_hand
+        feats = ds._lineup_features(lineup, games, hand)
+        return feats[feats["event_id"] == "g1"].iloc[0]
+
+    def test_is_confirmed_is_zero_in_backtest(self):
+        row = self._row()
+        assert row["home_lineup_is_confirmed"] == 0.0
+
+    def test_proj_renormalizes_over_present_batters(self):
+        # p1 = (.877*4 + 32)/110 = 0.3228; p2 = (.877*3 + 32)/109 = 0.3177;
+        # p3 (no prior line) drops. proj weights slots 1,2 only:
+        # (0.1216*0.3228 + 0.1190*0.3177)/(0.1216 + 0.1190).
+        row = self._row()
+        p1 = round((0.877 * 4 + 32) / 110, 4)
+        p2 = round((0.877 * 3 + 32) / 109, 4)
+        expected = (0.1216 * p1 + 0.1190 * p2) / (0.1216 + 0.1190)
+        assert row["home_lineup_woba_proj"] == pytest.approx(round(expected, 4))
+
+    def test_top4_vs_hand_uses_opposing_hand(self):
+        # Both prior games are vs R, so each batter's split == overall wOBA:
+        # p1 0.877*4/10 = 0.3508, p2 0.877*3/9 = 0.2923. Weighted over slots
+        # 1,2: (0.1216*0.3508 + 0.1190*0.2923)/(0.1216 + 0.1190).
+        row = self._row()
+        p1 = round(0.877 * 4 / 10, 4)
+        p2 = round(0.877 * 3 / 9, 4)
+        expected = (0.1216 * p1 + 0.1190 * p2) / (0.1216 + 0.1190)
+        assert row["home_top4_woba_vs_hand"] == pytest.approx(round(expected, 4))
+
+    def test_unknown_hand_leaves_top4_nan_but_proj_computed(self):
+        row = self._row(opp_hand={})
+        assert pd.isna(row["home_top4_woba_vs_hand"])
+        assert not pd.isna(row["home_lineup_woba_proj"])
+
+    def test_away_side_without_lineup_is_nan(self):
+        # Only T1 (home) has a seeded lineup; the away composition is empty.
+        row = self._row()
+        assert pd.isna(row["away_lineup_woba_proj"])
+        assert row["away_lineup_is_confirmed"] == 0.0
+
+    def test_no_lineup_frame_degrades_to_nan_and_confirmed_zero(self):
+        # Pre-backfill (no lineup frame): the wOBA columns are NaN (imputed)
+        # but is_confirmed is a concrete 0, never NaN — the backtest regime.
+        games = _synthetic_games()
+        frame = ds.build_training_frame(games, "moneyline", lineup=None)
+        for side in ("home", "away"):
+            assert (frame[f"{side}_lineup_is_confirmed"] == 0.0).all()
+            assert frame[f"{side}_lineup_woba_proj"].isna().all()
+            assert frame[f"{side}_top4_woba_vs_hand"].isna().all()
+
+    def test_doubleheader_game_one_does_not_leak_into_game_two(self):
+        # Two T1 home games on the SAME UTC day; p1 explodes in the AM game.
+        # The PM game's window is day < 2024-04-20, so the AM line (same day)
+        # must NOT enter p1's wOBA — only the 04-18 prior game counts.
+        lineup = pd.DataFrame(
+            [
+                _lineup_row("h0", (2024, 4, 18), "p1", True, None, "R", 10, 4, 0),
+                _lineup_row("gam", (2024, 4, 20), "p1", True, 100, "R", 5, 5, 0),
+                _lineup_row("gpm", (2024, 4, 20), "p1", True, 100, "R", 4, 0, 0),
+            ]
+        )
+        lineup["start_time_utc"] = pd.to_datetime(lineup["start_time_utc"], utc=True)
+        games = pd.DataFrame(
+            [
+                dict(event_id="gam", home_team_id="T1", away_team_id="T2",
+                     start_time_utc=datetime(2024, 4, 20, 17, 0, tzinfo=timezone.utc)),
+                dict(event_id="gpm", home_team_id="T1", away_team_id="T2",
+                     start_time_utc=datetime(2024, 4, 20, 23, 0, tzinfo=timezone.utc)),
+            ]
+        )
+        games["start_time_utc"] = pd.to_datetime(games["start_time_utc"], utc=True)
+        feats = ds._lineup_features(lineup, games, {})
+        pm = feats[feats["event_id"] == "gpm"].iloc[0]
+        # p1 wOBA from the 04-18 game ONLY: (.877*4 + 32)/110 = 0.3228.
+        assert pm["home_lineup_woba_proj"] == pytest.approx(round((0.877 * 4 + 32) / 110, 4))
+
+
 class TestMarketPriorSubset:
     def _frame(self):
         return ds.build_training_frame(_synthetic_games(), "moneyline")
@@ -454,6 +633,7 @@ def test_markdown_summary_renders_every_model_column():
             "moneyline": {
                 "rows": int(len(frame)), "seasons": [2018, 2023],
                 "sp_coverage": 0.0, "offense_coverage": 0.0,
+                "lineup_coverage": 0.0,
                 "bullpen_coverage": 0.0, "rows_with_market_prior": 0,
                 "report": report,
             }
@@ -547,6 +727,7 @@ def test_bulk_features_match_online_builder(seeded):
     from app.ml.dataset import (
         load_batting_frame,
         load_bullpen_frame,
+        load_lineup_frame,
         load_pitching_frame,
     )
 
@@ -557,12 +738,14 @@ def test_bulk_features_match_online_builder(seeded):
     # bulk frame's row for that same game must match field by field. The
     # seeded probables MATCH the actual starters, so the starter block must
     # agree too (probable-based online vs actual-starter bulk, and the
-    # offense split's selected hand likewise). The bullpen and offense
-    # blocks (day windows) must agree as well.
+    # offense split's selected hand likewise). The bullpen, offense and
+    # lineup blocks (day windows) must agree as well — the seeded
+    # event_lineups matches the box-score batting_order, so the per-batter
+    # wOBA (strictly prior in both paths) is identical.
     frame = build_training_frame(
         games, "moneyline",
         pitching=load_pitching_frame(db), bullpen=load_bullpen_frame(db),
-        batting=load_batting_frame(db),
+        batting=load_batting_frame(db), lineup=load_lineup_frame(db),
     )
     with db.connect() as conn:
         # as_of == start time (training convention) for the July 6th game,
@@ -580,6 +763,9 @@ def test_bulk_features_match_online_builder(seeded):
         "f5_games_30d", "f5_runs_pg_30d", "f5_runs_allowed_pg_30d",
         "rest_days", "games_last_7d",
         *ds.OFFENSE_FEATURE_NAMES,
+        # lineup wOBA features must byte-match (per-batter wOBA is strictly
+        # prior in both paths); lineup_is_confirmed is checked separately.
+        "lineup_woba_proj", "top4_woba_vs_hand",
         *ds.SP_FEATURE_NAMES,
         *ds.BP_FEATURE_NAMES,
     ):
@@ -590,3 +776,15 @@ def test_bulk_features_match_online_builder(seeded):
                 assert pd.isna(bulk_val), f"{side}_{name}: online None, bulk {bulk_val}"
             else:
                 assert bulk_val == pytest.approx(online_val), f"{side}_{name}"
+
+    # lineup_is_confirmed is the ONE intentionally divergent field (docs/04
+    # §1.5): online reads the archived pre-game snapshot (1), bulk reconstructs
+    # the realized box-score order (0). The flag IS the archive-vs-
+    # reconstruction regime marker, so it must NOT match — assert it directly.
+    for side in ("home", "away"):
+        assert online[side]["lineup_is_confirmed"] == 1, side
+        assert bulk[f"{side}_lineup_is_confirmed"] == 0, side
+    # And the wOBA features are genuinely present (not a vacuous None==NaN pass).
+    assert online["home"]["lineup_woba_proj"] is not None
+    assert online["away"]["lineup_woba_proj"] is not None
+    assert online["away"]["top4_woba_vs_hand"] is not None

@@ -84,6 +84,58 @@ especificación; esto registra cómo se aterrizó y por qué):
   dataset: elimina la clase de skew de fórmula duplicada; la paridad de ventanas sigue
   guardada por el test online/bulk.
 
+## Addenda (2026-07-15, tanda F1.3 — bloque de lineup)
+
+Concreciones de `docs/04 §1.5`, que da los nombres de features pero NO la fórmula de
+ponderación por orden ni la ventana/shrinkage por-bateador — se deciden y registran aquí.
+Primer consumidor de `batting_game_logs.batting_order`; convierte la ofensiva de "agregado
+de equipo marginal" (medido en train_f1 v4) en señal por-bateador.
+
+- **Ponderación por orden = PA-share por slot, vector fijo** (`LINEUP_PA_SHARE`, slots 1→9
+  `.1216 .1190 .1163 .1137 .1110 .1085 .1059 .1033 .1007`, suma 1): PA por slot de una
+  temporada de referencia 2017 (pre-dataset), normalizado y CONGELADO — as-of-safe por
+  construcción, mismo argumento que los pesos wOBA FanGraphs 2017. El leadoff ve más PA que
+  el 9. A una feature solo le importan orden y estabilidad, no la escala; por eso la
+  ponderación renormaliza sobre los slots presentes (lineup incompleto o bateador sin línea
+  → su slot cae del promedio, nunca se rellena).
+- **Ventana de wOBA por-bateador = 365 días** (`LINEUP_BATTER_WINDOW_DAYS`), no 30d: un
+  bateador tiene ~100 PA en 30d, dominado por ruido; 365d espeja `OFFENSE_SPLIT_TARGET_DAYS`.
+  Corte estricto `día < día del evento` (intradía/doubleheader-seguro, igual que §1.2).
+- **Shrinkage por-bateador hacia un prior de liga CONGELADO** (`LINEUP_BATTER_WOBA_PRIOR`
+  = 0.320, promedio MLB pre-2018, leak-free por construcción) con `LINEUP_BATTER_SHRINK_PA`
+  = 100 PA: `wOBA = (num + 100·0.320)/(den + 100)`. **Un bateador con 0 PA en el año se
+  descarta (None), jamás se le inyecta el prior** — inyectar el promedio de liga fabricaría
+  un bateador inexistente en la proyección. El split vs mano del top-4 shrinkea hacia la
+  wOBA overall 365d DEL PROPIO bateador (`LINEUP_SPLIT_SHRINK_PA` = 50, no se reusa
+  `shrunk_split` que fija 200 y ahogaría a un bateador); sin PA vs esa mano → prior puro
+  (su overall), None solo sin overall.
+- **`lineup_is_confirmed` — el marcador honesto del régimen.** En backtest/bulk es SIEMPRE
+  0: no hay snapshots de lineup pre-juego para temporadas anteriores al pipeline, así que se
+  reconstruye el lineup REALIZADO del box score (`batting_order % 100 == 0` = los 9
+  titulares) — sesgo optimista documentado, simétrico al probable-vs-abridor-real de §1.3.
+  En producción (online) es 1 sii existe un snapshot en `event_lineups` con
+  `first_seen_at ≤ as_of`; sin él, el bloque es None y `is_confirmed=0` (el online NUNCA lee
+  el box score, que solo se conoce al inicio del juego). **Riesgo registrado**: como en el
+  backtest `is_confirmed` es constante-0, no aporta señal entrenable HOY; se conserva por
+  honestidad y para el retrain futuro cuando `event_lineups` madure en producción. La señal
+  real de esta tanda vive en `lineup_woba_proj`/`top4_woba_vs_hand`, que sí varían por juego.
+- **Archivo as-of `event_lineups`** (migración 005, espejo de `event_probables`):
+  append-por-snapshot, un snapshot = las filas con un mismo `first_seen_at` para
+  `(event, side)`; se inserta uno nuevo solo si el orden anunciado difiere (dedupe en la
+  capa store). Lo llena el job `sync_lineups` en la cadencia pre-juego (:23/:53), leyendo el
+  `battingOrder` del boxscore (posteado ~1-4h antes; parser `parse_boxscore_lineup`
+  agnóstico de stats, porque pre-juego todos los bateadores tienen 0 PA). Nunca archiva tras
+  el primer pitch (as-of safety). El path bulk NO usa esta tabla: la composición del
+  backtest sale del `batting_order` de `batting_game_logs` (004), así que train_f1 corre
+  igual pre-005.
+- **El bloque entra a ML y a F5** (60/52 columnas): `top4_woba_vs_hand` en F5 realiza el
+  sobrepeso de la primera vuelta que §1.9 pedía. `star_out_flag` (§1.5) queda fuera: exige
+  transacciones/IL aún no ingeridas (diferido con `closer_available_flag`, §1.4).
+- **Fórmulas en `app/features/lineup.py`** (reusa `woba_parts` de `offense.py`), importado
+  por builder y dataset: la paridad online/bulk la sigue guardando el test campo-a-campo,
+  con `lineup_is_confirmed` como el ÚNICO campo divergente por diseño (online 1 vs bulk 0),
+  excluido del match y asertado aparte.
+
 ## Principios no negociables (del brief original)
 
 - No se promete rentabilidad. El producto vende claridad, control de riesgo y trazabilidad.

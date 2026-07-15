@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from app.ingestion.parsers import (
     OddsEvent,
     parse_boxscore_batting,
+    parse_boxscore_lineup,
     parse_boxscore_pitching,
     parse_odds_event,
     parse_schedule,
@@ -303,3 +304,49 @@ class TestParseBoxscoreBatting:
         catcher = next(l for l in box.lines if l.mlb_person_id == 700010)
         assert catcher.plate_appearances is None
         assert catcher.at_bats == 4  # the rest of the line is intact
+
+
+class TestParseBoxscoreLineup:
+    def _parsed(self):
+        return parse_boxscore_lineup(load_fixture("mlb_boxscore.json"))
+
+    def test_starters_only_by_slot(self):
+        # Starters are the multiples of 100; the sub at 901 is excluded.
+        box = self._parsed()
+        slots = {(s.is_home, s.batting_order): s.mlb_person_id for s in box.slots}
+        assert slots == {
+            (True, 100): 700011, (True, 200): 700010,
+            (False, 100): 700021, (False, 600): 700020, (False, 900): 700002,
+        }
+        assert all(s.batting_order % 100 == 0 for s in box.slots)
+
+    def test_partial_lineup_is_flagged(self):
+        # Both sides carry <9 starters in this fixture: a partial lineup is
+        # surfaced (a posted lineup has 9; fewer is drift or not-yet-posted).
+        box = self._parsed()
+        assert "home:partial_lineup:2" in box.anomalies
+        assert "away:partial_lineup:3" in box.anomalies
+
+    def test_reads_order_without_a_batting_stats_block(self):
+        # Pre-game the batting stats block is empty but battingOrder is set;
+        # unlike parse_boxscore_batting, the lineup parser must still read it.
+        payload = load_fixture("mlb_boxscore.json")
+        for side in ("home", "away"):
+            for entry in payload["teams"][side]["players"].values():
+                entry.setdefault("stats", {})["batting"] = {}
+        box = parse_boxscore_lineup(payload)
+        assert {s.mlb_person_id for s in box.slots} == {
+            700011, 700010, 700021, 700020, 700002
+        }
+
+    def test_duplicate_slot_is_flagged(self):
+        payload = load_fixture("mlb_boxscore.json")
+        payload["teams"]["home"]["players"]["ID700010"]["battingOrder"] = "100"
+        box = parse_boxscore_lineup(payload)
+        assert "home:duplicate_slot:100" in box.anomalies
+
+    def test_empty_payload_no_slots_no_anomalies(self):
+        # A side with zero starters is normal pre-game (lineup not posted),
+        # so an all-empty payload is silent, not an anomaly.
+        box = parse_boxscore_lineup({"teams": {"home": {}, "away": {}}})
+        assert box.slots == () and box.anomalies == ()

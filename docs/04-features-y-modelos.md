@@ -134,6 +134,27 @@ incertidumbre que producción: si el pick se genera a las 10:00 y el lineup sali
 15:00, el feature vector usa proyección con `is_confirmed=false`. El modelo puede
 aprender a ser menos agresivo cuando el flag es falso — eso es una virtud, no un bug.
 
+**Implementación (tanda F1.3, detalle y constantes en `docs/00` addendum 2026-07-15):**
+
+- **Fórmula de ponderación** (el doc dice "ponderada"; se fija aquí):
+  `lineup_woba_proj = Σ_slot PA_share[slot]·wOBA_bateador,as-of / Σ_slot PA_share[slot]`
+  sobre los slots presentes con wOBA no-None (renormalización: un lineup incompleto o un
+  bateador sin línea del año simplemente cae del promedio). `top4_woba_vs_hand` es la misma
+  suma ponderada sobre los slots 1-4 con `PA_share[:4]` renormalizado, usando la wOBA de
+  cada bateador vs la mano del abridor rival. `PA_share` es un vector fijo por slot
+  (as-of-safe, congelado). La wOBA por-bateador es 365d as-of shrunk hacia un prior de liga
+  congelado; **bateador con 0 PA en el año → slot descartado, nunca el prior** (fabricaría
+  un bateador). El código llama al flag `lineup_is_confirmed`.
+- **Limitación honesta del histórico (simétrica a §1.3):** para temporadas anteriores al
+  pipeline NO existen snapshots archivados de "lineup as-of". El backtest reconstruye el
+  lineup REALIZADO del box score (`batting_order`) con `is_confirmed=false` — reproduce la
+  incertidumbre de producción en el flag, pero la COMPOSICIÓN es la realizada, lo que sesga
+  el resultado **ligeramente al alza** (elimina el riesgo de un cambio de último minuto en
+  quién juega). Se documenta como supuesto del backtest y desaparece hacia adelante conforme
+  `sync_lineups` archiva sus propios snapshots (`event_lineups`, migración 005); producción
+  y paper trading no tienen este sesgo. Como en el backtest `is_confirmed` es constante-0,
+  no aporta señal entrenable hasta que ese archivo madure — se conserva por honestidad.
+
 ### 1.6 Bloque: park factors
 
 | Feature | Definición | Ventana | Regla as-of |

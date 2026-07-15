@@ -436,6 +436,81 @@ def parse_boxscore_batting(payload: dict[str, Any]) -> BoxscoreBatting:
     )
 
 
+@dataclass(frozen=True)
+class LineupSlot:
+    """One STARTER's slot in a posted lineup (docs/04 §1.5).
+
+    ``batting_order`` is MLB's hundreds encoding: 100 = leadoff starter,
+    200 = 2-hole, ... 900 = 9th. Only starters (a multiple of 100) are
+    emitted — mid-game subs (101, 201, ...) are not lineup data.
+    """
+
+    mlb_person_id: int
+    full_name: str
+    is_home: bool
+    batting_order: int
+
+
+@dataclass(frozen=True)
+class BoxscoreLineup:
+    """The posted starting lineups of one game plus parsing anomalies."""
+
+    slots: tuple[LineupSlot, ...]
+    anomalies: tuple[str, ...]  # surfaced in job summaries, never silent
+
+
+def parse_boxscore_lineup(payload: dict[str, Any]) -> BoxscoreLineup:
+    """Extract the posted STARTING lineups from a boxscore, stats-agnostic.
+
+    Unlike ``parse_boxscore_batting`` (which needs a non-empty batting stat
+    block and drops zero-PA lines), this reads the ``battingOrder`` field on
+    each player entry directly — the lineup is posted ~1-4h before first
+    pitch, when every batter still has zero plate appearances, so requiring
+    stats would find nothing pre-game. Only starters (``battingOrder`` a
+    multiple of 100) are returned.
+
+    A side with zero starters is normal pre-game (lineup not posted yet), so
+    it is NOT an anomaly. A PARTIAL side (1-8 starters, or a duplicated slot,
+    or a slot without a person id) IS surfaced — that is what a field-name
+    drift in the feed would look like, and it must be loud, not silent.
+    """
+    slots: list[LineupSlot] = []
+    anomalies: list[str] = []
+
+    for side_key, is_home in (("home", True), ("away", False)):
+        side = (payload.get("teams") or {}).get(side_key) or {}
+        seen: dict[int, int] = {}  # batting_order -> person id
+        for entry in (side.get("players") or {}).values():
+            try:
+                order = int(entry.get("battingOrder"))
+            except (TypeError, ValueError):
+                continue
+            if order < 100 or order % 100 != 0:
+                continue  # subs (101, 201, ...) and junk are not starters
+            person = entry.get("person") or {}
+            pid = person.get("id")
+            if pid is None:
+                anomalies.append(f"{side_key}:lineup_slot_without_person_id:{order}")
+                continue
+            pid = int(pid)
+            if order in seen:
+                anomalies.append(f"{side_key}:duplicate_slot:{order}")
+                continue
+            seen[order] = pid
+            slots.append(
+                LineupSlot(
+                    mlb_person_id=pid,
+                    full_name=person.get("fullName") or f"MLB person {pid}",
+                    is_home=is_home,
+                    batting_order=order,
+                )
+            )
+        if 0 < len(seen) < 9:
+            anomalies.append(f"{side_key}:partial_lineup:{len(seen)}")
+
+    return BoxscoreLineup(slots=tuple(slots), anomalies=tuple(anomalies))
+
+
 def _outs_from_stats(stats: dict[str, Any]) -> int | None:
     """Outs recorded: the ``outs`` stat, else parsed from ``inningsPitched``.
 
