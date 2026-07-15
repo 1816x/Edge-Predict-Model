@@ -258,6 +258,26 @@ CREATE TABLE event_probables (
     created_at    timestamptz NOT NULL DEFAULT now()
 );
 
+-- Published batting orders as an append-per-snapshot history (migration
+-- 005). A "snapshot" is the set of rows sharing one first_seen_at for one
+-- (event, side); a new snapshot is inserted whenever the announced lineup
+-- DIFFERS from the currently-recorded one (dedupe in the store layer, same
+-- reasoning as event_probables). The lineup "as-of T" is the rows with the
+-- greatest first_seen_at <= T. batting_order uses MLB's hundreds encoding
+-- (100 = leadoff starter, 200 = 2-hole, ...); the starter of a slot is
+-- batting_order % 100 == 0. Backtest reconstructs the realized lineup from
+-- batting_game_logs.batting_order instead (no pre-pipeline snapshots exist)
+-- with is_confirmed=false, a documented optimistic bias like §1.3.
+CREATE TABLE event_lineups (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id      uuid NOT NULL REFERENCES events (id),
+    side          text NOT NULL CHECK (side IN ('home', 'away')),
+    batting_order integer NOT NULL CHECK (batting_order >= 100),
+    player_id     uuid NOT NULL REFERENCES players (id),
+    first_seen_at timestamptz NOT NULL DEFAULT now(),
+    created_at    timestamptz NOT NULL DEFAULT now()
+);
+
 -- ============================================================================
 -- Odds snapshots (append-only)
 -- ============================================================================
@@ -463,6 +483,8 @@ CREATE INDEX idx_feature_snapshots_event_market_asof
 CREATE INDEX idx_pitching_logs_player ON pitching_game_logs (player_id);
 CREATE INDEX idx_event_probables_event
     ON event_probables (event_id, side, first_seen_at DESC);
+CREATE INDEX idx_event_lineups_asof
+    ON event_lineups (event_id, side, first_seen_at DESC);
 
 -- Batting history per player (lineup block, §1.5) and per team (offense
 -- block windows, §1.2 — the online builder queries by team_id directly).
