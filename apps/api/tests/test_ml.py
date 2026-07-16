@@ -728,7 +728,7 @@ def test_markdown_summary_renders_every_model_column():
             "moneyline": {
                 "rows": int(len(frame)), "seasons": [2018, 2023],
                 "sp_coverage": 0.0, "offense_coverage": 0.0,
-                "lineup_coverage": 0.0,
+                "lineup_coverage": 0.0, "star_out_coverage": 0.0,
                 "bullpen_coverage": 0.0, "rows_with_market_prior": 0,
                 "report": report,
             }
@@ -806,6 +806,12 @@ def test_train_f1_job_reports_sp_coverage(seeded):
     # (A) never bats in the seeds.
     assert block["offense_coverage"] == 0.6
     assert "batting_note" not in result
+    # star_out coverage is 0: the seed has no >=200-PA star and no IL archive,
+    # so the flag is honestly None everywhere (present in BOTH markets, never a
+    # fabricated 0), and no migration-006 note fires (the table exists, empty).
+    assert block["star_out_coverage"] == 0.0
+    assert result["markets"]["f5_moneyline"]["star_out_coverage"] == 0.0
+    assert "transactions_note" not in result
     # Not enough seasons to test anything: the report stays honest and empty.
     assert block["report"]["seasons"] == {}
 

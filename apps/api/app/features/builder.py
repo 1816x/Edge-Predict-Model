@@ -851,7 +851,7 @@ def build_features(
     # column, and keeping it out lets identical vectors captured at different
     # times dedupe on (event, market, feature_hash) as the schema intends.
     return {
-        "feature_version": "team_form_sp_bp_off_lineup_v5",
+        "feature_version": "team_form_sp_bp_off_lineup_star_v6",
         "market": market,
         "home": sides["home"],
         "away": sides["away"],

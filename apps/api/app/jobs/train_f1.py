@@ -36,6 +36,7 @@ from app.ml.dataset import (
     load_market_prior,
     load_pitching_frame,
     load_results_frame,
+    load_transactions_frame,
 )
 from app.ml.train import MIN_GATE_N, walk_forward_report
 
@@ -68,6 +69,19 @@ def _lineup_coverage(frame) -> float:
     both = (
         frame["home_lineup_woba_proj"].notna()
         & frame["away_lineup_woba_proj"].notna()
+    )
+    return round(float(both.mean()), 4) if len(frame) else 0.0
+
+
+def _star_out_coverage(frame) -> float:
+    """Share of rows where BOTH teams carry a real star_out_flag (docs/04 §1.5).
+
+    Lower than lineup coverage by design: the flag is None until the
+    transactions archive is alive as-of AND the team has an established (>=200
+    PA) star to speak of — early April and thin rosters legitimately have no
+    star, and a hole must never read as a fabricated 0."""
+    both = (
+        frame["home_star_out_flag"].notna() & frame["away_star_out_flag"].notna()
     )
     return round(float(both.mean()), 4) if len(frame) else 0.0
 
@@ -151,8 +165,23 @@ def run(
             "backfill_pitching (team offense and lineup features are all NaN)"
         )
 
+    # Transactions/IL archive has its own try (migration 006 is newer): pre-006
+    # the report still trains, only star_out_flag degrades to NaN.
+    transactions = None
+    try:
+        transactions = load_transactions_frame(engine)
+        if len(transactions) == 0:
+            transactions = None
+    except (ProgrammingError, DatabaseError):
+        out["transactions_note"] = (
+            "player_transactions missing; apply migration 006 and run "
+            "sync_transactions (star_out_flag is all NaN this run)"
+        )
+
     for market in markets:
-        frame = build_training_frame(games, market, pitching, bullpen, batting, lineup)
+        frame = build_training_frame(
+            games, market, pitching, bullpen, batting, lineup, transactions
+        )
         prior = load_market_prior(engine, market)
         frame = frame.merge(prior, on="event_id", how="left")
         block = {
@@ -167,6 +196,9 @@ def run(
             # Lineup block coverage: 0 until the batting backfill fills the
             # realized batting_order (both markets carry it).
             "lineup_coverage": _lineup_coverage(frame),
+            # star_out_flag coverage (both markets): fraction with an alive IL
+            # archive AND an identifiable star; lower than lineup by design.
+            "star_out_coverage": _star_out_coverage(frame),
             "rows_with_market_prior": int(frame["market_prior_p_home"].notna().sum()),
             "report": walk_forward_report(
                 frame, min_train_seasons, feature_columns(market)
@@ -188,7 +220,8 @@ def _markdown_summary(result: dict[str, Any]) -> str:
         coverage = (
             f"sp_coverage {block['sp_coverage']}, "
             f"offense_coverage {block['offense_coverage']}, "
-            f"lineup_coverage {block['lineup_coverage']}"
+            f"lineup_coverage {block['lineup_coverage']}, "
+            f"star_out_coverage {block['star_out_coverage']}"
         )
         if "bullpen_coverage" in block:
             coverage += f", bullpen_coverage {block['bullpen_coverage']}"
