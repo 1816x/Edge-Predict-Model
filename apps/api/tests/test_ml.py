@@ -817,6 +817,36 @@ def test_train_f1_job_reports_sp_coverage(seeded):
 
 
 @pytest.mark.integration
+def test_train_f1_degrades_without_migration_006(seeded):
+    """Pre-006 window: train_f1 still trains on everything else and only
+    star_out_flag degrades to NaN (pandas wraps the missing-table error in its
+    own DatabaseError, not sqlalchemy's ProgrammingError — the exact gotcha
+    the batting/lineup degradation already learned)."""
+    from pathlib import Path
+
+    from sqlalchemy import text as sql_text
+
+    from app.jobs import apply_migration, train_f1
+
+    db, _, _ = seeded
+    with db.begin() as conn:
+        conn.execute(sql_text("DROP TABLE player_transactions"))
+    try:
+        result = train_f1.run(engine=db)
+        assert "apply migration 006" in result["transactions_note"]
+        # The rest of the report is intact: sp/offense coverage still computed.
+        block = result["markets"]["moneyline"]
+        assert block["sp_coverage"] == 0.2
+        assert block["star_out_coverage"] == 0.0  # all NaN, honest 0 coverage
+    finally:
+        migration = (
+            Path(__file__).parents[3] / "infra" / "migrations"
+            / "006-player-transactions.sql"
+        )
+        apply_migration.run(str(migration), engine=db)
+
+
+@pytest.mark.integration
 def test_bulk_features_match_online_builder(seeded):
     """The training dataset and the online builder must produce IDENTICAL
     numbers for the same game — otherwise train/serve skew poisons F1."""

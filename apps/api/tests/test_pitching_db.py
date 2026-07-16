@@ -406,6 +406,32 @@ def test_sync_transactions_idempotent_with_drift_canary(db):
 
 
 @pytest.mark.integration
+def test_sync_transactions_degrades_without_migration_006(db):
+    """Pre-006 window (code merged, migration not applied): the whole job
+    degrades to a skipped note instead of failing the daily cron."""
+    from pathlib import Path
+
+    from sqlalchemy import text as sql_text
+
+    from app.jobs import apply_migration, sync_transactions
+
+    with db.begin() as conn:
+        conn.execute(sql_text("DROP TABLE player_transactions"))
+    try:
+        summary = sync_transactions.run(
+            "2026-07-10", "2026-07-13", client=FakeTxnClient(), engine=db,
+            sleep_seconds=0.0,
+        )
+        assert "apply migration 006" in summary["skipped"]
+    finally:
+        migration = (
+            Path(__file__).parents[3] / "infra" / "migrations"
+            / "006-player-transactions.sql"
+        )
+        apply_migration.run(str(migration), engine=db)
+
+
+@pytest.mark.integration
 def test_placeholder_name_never_clobbers_real_name(db):
     from app.ingestion import store
 
