@@ -9,6 +9,7 @@ from app.ingestion.parsers import (
     parse_boxscore_pitching,
     parse_odds_event,
     parse_schedule,
+    parse_transactions,
 )
 
 from conftest import load_fixture
@@ -350,3 +351,47 @@ class TestParseBoxscoreLineup:
         # so an all-empty payload is silent, not an anomaly.
         box = parse_boxscore_lineup({"teams": {"home": {}, "away": {}}})
         assert box.slots == () and box.anomalies == ()
+
+
+class TestParseTransactions:
+    def _batch(self):
+        return parse_transactions(load_fixture("mlb_transactions.json"))
+
+    def test_keeps_well_formed_rows_verbatim(self):
+        batch = self._batch()
+        # 4 kept (900001, 900002, 900003, 900007); 3 dropped as anomalies.
+        assert {r.mlb_transaction_id for r in batch.rows} == {
+            900001, 900002, 900003, 900007
+        }
+
+    def test_uses_announce_date_not_effective_date(self):
+        # The as-of gate is the ANNOUNCE date. The IL placement is announced
+        # 2026-07-10 but retro-dated (effectiveDate) to 07-08 — using the
+        # retro date would leak the injury before it was public.
+        from datetime import date
+
+        judge = next(r for r in self._batch().rows if r.mlb_transaction_id == 900001)
+        assert judge.transaction_date == date(2026, 7, 10)
+        assert judge.mlb_person_id == 592450
+        assert judge.type_code == "SC"
+        assert "10-day injured list" in judge.description
+
+    def test_trade_preserved_with_from_and_to_team(self):
+        betts = next(r for r in self._batch().rows if r.mlb_transaction_id == 900003)
+        assert betts.type_desc == "Trade"
+        assert betts.from_team_mlb_id == 119
+        assert betts.to_team_mlb_id == 111
+
+    def test_anomalies_are_loud_not_silent(self):
+        anomalies = self._batch().anomalies
+        # missing person id, missing transaction id, missing date — each loud.
+        assert any("txn_without_person_id:900004" == a for a in anomalies)
+        assert any(a.startswith("txn_without_id:") for a in anomalies)
+        assert any("txn_without_date:900006" == a for a in anomalies)
+        assert len(anomalies) == 3
+
+    def test_taxonomy_is_not_decided_by_the_parser(self):
+        # The parser normalizes raw text only; IL classification lives in the
+        # feature layer. A 'transferred to the 60-day IL' desc is kept verbatim.
+        weird = next(r for r in self._batch().rows if r.mlb_transaction_id == 900007)
+        assert "60-day injured list" in weird.description

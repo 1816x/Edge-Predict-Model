@@ -99,7 +99,7 @@ def test_starter_block_hand_computed_values(seeded):
     )
     assert away["bullpen_ip_expected"] == 5.0  # SP2: 15 outs in his one start
 
-    assert features["feature_version"] == "team_form_sp_bp_off_lineup_v5"
+    assert features["feature_version"] == "team_form_sp_bp_off_lineup_star_v6"
 
 
 def test_offense_block_hand_computed_values(seeded):

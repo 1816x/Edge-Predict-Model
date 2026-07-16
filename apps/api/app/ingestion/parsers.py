@@ -9,7 +9,7 @@ Postgres.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from app.core.devig import decimal_to_american
@@ -509,6 +509,109 @@ def parse_boxscore_lineup(payload: dict[str, Any]) -> BoxscoreLineup:
             anomalies.append(f"{side_key}:partial_lineup:{len(seen)}")
 
     return BoxscoreLineup(slots=tuple(slots), anomalies=tuple(anomalies))
+
+
+@dataclass(frozen=True)
+class PlayerTransaction:
+    """One RAW player transaction from the MLB Stats API /transactions feed.
+
+    Stored verbatim (docs/04 §1.5, migration 006): the IL classification
+    (placement vs activation) is NOT decided here — it lives versioned in
+    ``app/features/transactions.py`` over ``type_desc`` + ``description``. The
+    parser only normalizes fields and surfaces drift as anomalies.
+
+    ``transaction_date`` is the feed's ``date`` (the ANNOUNCE date, no time) —
+    the as-of gate for backtest is ``transaction_date < event_day`` (<= t-1),
+    so ``effectiveDate`` (which MLB retro-dates on IL placements) is
+    deliberately IGNORED to avoid leaking an injury before it was public.
+    ``mlb_transaction_id`` is the feed's stable natural key (the idempotency
+    key); a row without one is dropped as an anomaly (it could not dedupe).
+    """
+
+    mlb_transaction_id: int
+    mlb_person_id: int
+    full_name: str
+    from_team_mlb_id: int | None
+    to_team_mlb_id: int | None
+    type_code: str | None
+    type_desc: str | None
+    description: str | None
+    transaction_date: date
+
+
+@dataclass(frozen=True)
+class TransactionsBatch:
+    """The parsed transactions of one date-range call plus parsing anomalies."""
+
+    rows: tuple[PlayerTransaction, ...]
+    anomalies: tuple[str, ...]  # surfaced in job summaries, never silent
+
+
+def _parse_date(value: str | None) -> date | None:
+    """Parse a ``YYYY-MM-DD`` feed date. Tolerates a trailing time if present."""
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value[:10])
+    except ValueError:
+        return None
+
+
+def parse_transactions(payload: dict[str, Any]) -> TransactionsBatch:
+    """Normalize ``GET /api/v1/transactions`` into raw transaction rows.
+
+    Stats-agnostic and taxonomy-agnostic: every transaction with a stable id,
+    a person id and a parseable date is kept verbatim (type_code/type_desc/
+    description untouched). Drops with a loud anomaly:
+    - a transaction without ``id`` (the idempotency key — cannot dedupe),
+    - a transaction without ``person.id`` (nothing to attribute the move to),
+    - a transaction without a parseable ``date`` (the as-of gate).
+    A ``person`` that is a team-level entry (no id) is such an anomaly, not a
+    silent skip: that is what a field-name drift in the feed would look like.
+    """
+    rows: list[PlayerTransaction] = []
+    anomalies: list[str] = []
+
+    for entry in payload.get("transactions") or []:
+        txn_id = entry.get("id")
+        if txn_id is None:
+            person = entry.get("person") or {}
+            anomalies.append(
+                f"txn_without_id:person={person.get('id')}:{entry.get('date')}"
+            )
+            continue
+        txn_id = int(txn_id)
+        person = entry.get("person") or {}
+        pid = person.get("id")
+        if pid is None:
+            anomalies.append(f"txn_without_person_id:{txn_id}")
+            continue
+        pid = int(pid)
+        tdate = _parse_date(entry.get("date"))
+        if tdate is None:
+            anomalies.append(f"txn_without_date:{txn_id}")
+            continue
+        from_team = entry.get("fromTeam") or {}
+        to_team = entry.get("toTeam") or {}
+        rows.append(
+            PlayerTransaction(
+                mlb_transaction_id=txn_id,
+                mlb_person_id=pid,
+                full_name=person.get("fullName") or f"MLB person {pid}",
+                from_team_mlb_id=(
+                    int(from_team["id"]) if from_team.get("id") is not None else None
+                ),
+                to_team_mlb_id=(
+                    int(to_team["id"]) if to_team.get("id") is not None else None
+                ),
+                type_code=entry.get("typeCode"),
+                type_desc=entry.get("typeDesc"),
+                description=entry.get("description"),
+                transaction_date=tdate,
+            )
+        )
+
+    return TransactionsBatch(rows=tuple(rows), anomalies=tuple(anomalies))
 
 
 def _outs_from_stats(stats: dict[str, Any]) -> int | None:

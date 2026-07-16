@@ -75,6 +75,7 @@ from app.features.offense import (
     woba,
     woba_parts,
 )
+from app.features.transactions import il_effect, il_out_asof, top_k_star_players
 
 ROLLING_WINDOW = timedelta(days=30)
 RECENT_WINDOW = timedelta(days=7)
@@ -130,6 +131,7 @@ FEATURE_TABLES = (
     "event_probables",
     "batting_game_logs",
     "event_lineups",
+    "player_transactions",
 )
 
 
@@ -507,6 +509,66 @@ def _offense_block(
     return block
 
 
+def _star_out_block(conn, t, team_id, event_day) -> int | None:
+    """Count of the team's top-2 established batters on the IL as-of (§1.5).
+
+    Independent of the lineup snapshot: a star can be out whether or not a
+    lineup is posted, so this uses only team batting + the transactions archive
+    (never the slot machinery). None (not 0) when the transactions archive is
+    NOT alive as-of the game, or when no established star is identifiable — a
+    zero would fabricate "everyone healthy" where the truth is "no data". A
+    real 0 means the archive is alive, the top-2 are known, and neither is out.
+    """
+    txns = t["player_transactions"]
+    alive = conn.execute(
+        select(txns.c.id).where(txns.c.transaction_date < event_day).limit(1)
+    ).first()
+    if alive is None:
+        return None  # archive not alive as-of: unknown, never a fabricated 0
+
+    batting, events = t["batting_game_logs"], t["events"]
+    day = _utc_day_expr(events)
+    rows = conn.execute(
+        select(
+            batting.c.player_id.label("player_id"),
+            *[func.sum(batting.c[key]).label(key) for key in SUM_KEYS],
+        )
+        .select_from(batting.join(events, events.c.id == batting.c.event_id))
+        .where(
+            batting.c.team_id == team_id,
+            day >= event_day - timedelta(days=LINEUP_BATTER_WINDOW_DAYS),
+            day < event_day,
+        )
+        .group_by(batting.c.player_id)
+    ).all()
+    player_sums = {
+        r.player_id: {key: float(getattr(r, key)) for key in SUM_KEYS} for r in rows
+    }
+    stars = top_k_star_players(player_sums)
+    if not stars:
+        return None  # no established star identifiable as-of: unknown, not 0
+
+    tx_rows = conn.execute(
+        select(
+            txns.c.player_id,
+            txns.c.type_code,
+            txns.c.type_desc,
+            txns.c.description,
+            txns.c.transaction_date,
+            txns.c.mlb_transaction_id,
+        ).where(txns.c.player_id.in_(stars), txns.c.transaction_date < event_day)
+    ).all()
+    moves: dict[Any, list] = {}
+    for r in tx_rows:
+        effect = il_effect(r.type_code, r.type_desc, r.description)
+        if effect is None:
+            continue
+        moves.setdefault(r.player_id, []).append(
+            (r.transaction_date, r.mlb_transaction_id, effect)
+        )
+    return sum(1 for pid in stars if il_out_asof(moves.get(pid, []), event_day))
+
+
 def _lineup_block(
     conn: Connection,
     t: dict[str, Table],
@@ -532,6 +594,9 @@ def _lineup_block(
     """
     block: dict[str, Any] = {name: None for name in LINEUP_FEATURE_NAMES}
     block["lineup_is_confirmed"] = 0
+    # star_out_flag is independent of the lineup snapshot and must survive the
+    # early returns below (no snapshot / no slots), so compute it FIRST.
+    block["star_out_flag"] = _star_out_block(conn, t, team_id, event_day)
 
     lineups = t["event_lineups"]
     latest_ts = conn.execute(
@@ -786,7 +851,7 @@ def build_features(
     # column, and keeping it out lets identical vectors captured at different
     # times dedupe on (event, market, feature_hash) as the schema intends.
     return {
-        "feature_version": "team_form_sp_bp_off_lineup_v5",
+        "feature_version": "team_form_sp_bp_off_lineup_star_v6",
         "market": market,
         "home": sides["home"],
         "away": sides["away"],

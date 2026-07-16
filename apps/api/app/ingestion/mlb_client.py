@@ -105,6 +105,33 @@ class MlbClient:
                 raise MlbApiError(f"MLB Stats API returned {resp.status_code}: {resp.text[:500]}")
             return resp.json()
 
+    def get_transactions(
+        self, start_date: str, end_date: str, sport_id: int = 1
+    ) -> dict[str, Any]:
+        """Player transactions (incl. IL moves) for a date range.
+
+        Calls ``GET /api/v1/transactions?sportId=1&startDate=...&endDate=...``.
+        Returns ``{"transactions": [...]}`` where each entry carries a stable
+        ``id``, ``person``, ``typeCode``/``typeDesc``, a free-text
+        ``description`` (where the IL detail usually lives), ``date`` (announce
+        date), ``fromTeam``/``toTeam``. Used by ``sync_transactions`` to archive
+        the IL history as-of (docs/04 §1.5, star_out_flag). One range call per
+        chunk — no per-game fanout — so chunks can be large.
+
+        Raises:
+            MlbApiError: on non-2xx response.
+        """
+        params = {
+            "sportId": str(sport_id),
+            "startDate": start_date,
+            "endDate": end_date,
+        }
+        with httpx.Client(base_url=BASE_URL, timeout=self._timeout) as client:
+            resp = client.get("/api/v1/transactions", params=params)
+            if resp.status_code != 200:
+                raise MlbApiError(f"MLB Stats API returned {resp.status_code}: {resp.text[:500]}")
+            return resp.json()
+
     def get_people(self, person_ids: list[int]) -> dict[str, Any]:
         """Bio data for up to ~100 players in one call.
 

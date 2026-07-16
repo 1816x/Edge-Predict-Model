@@ -1,0 +1,72 @@
+{
+  "copyright": "Copyright 2026 MLB Advanced Media",
+  "transactions": [
+    {
+      "id": 900001,
+      "person": {"id": 592450, "fullName": "Aaron Judge"},
+      "typeCode": "SC",
+      "typeDesc": "Status Change",
+      "description": "New York Yankees placed RF Aaron Judge on the 10-day injured list retroactive to July 8, 2026. Right hip flexor strain.",
+      "date": "2026-07-10",
+      "effectiveDate": "2026-07-08",
+      "resolutionDate": "2026-07-10",
+      "fromTeam": {"id": 147, "name": "New York Yankees"},
+      "toTeam": {"id": 147, "name": "New York Yankees"}
+    },
+    {
+      "id": 900002,
+      "person": {"id": 545361, "fullName": "Mike Trout"},
+      "typeCode": "SC",
+      "typeDesc": "Status Change",
+      "description": "Los Angeles Angels activated CF Mike Trout from the 10-day injured list.",
+      "date": "2026-07-11",
+      "effectiveDate": "2026-07-11",
+      "resolutionDate": "2026-07-11",
+      "fromTeam": {"id": 108, "name": "Los Angeles Angels"},
+      "toTeam": {"id": 108, "name": "Los Angeles Angels"}
+    },
+    {
+      "id": 900003,
+      "person": {"id": 605141, "fullName": "Mookie Betts"},
+      "typeCode": "TR",
+      "typeDesc": "Trade",
+      "description": "Los Angeles Dodgers traded RF Mookie Betts to the Boston Red Sox.",
+      "date": "2026-07-12",
+      "fromTeam": {"id": 119, "name": "Los Angeles Dodgers"},
+      "toTeam": {"id": 111, "name": "Boston Red Sox"}
+    },
+    {
+      "id": 900004,
+      "person": {},
+      "typeCode": "SC",
+      "typeDesc": "Status Change",
+      "description": "A team-level move without a person id.",
+      "date": "2026-07-12"
+    },
+    {
+      "person": {"id": 999999, "fullName": "No Id Guy"},
+      "typeCode": "SC",
+      "typeDesc": "Status Change",
+      "description": "A transaction with no stable id (cannot dedupe).",
+      "date": "2026-07-12"
+    },
+    {
+      "id": 900006,
+      "person": {"id": 111222, "fullName": "No Date Guy"},
+      "typeCode": "SC",
+      "typeDesc": "Status Change",
+      "description": "A transaction without a parseable date.",
+      "date": null
+    },
+    {
+      "id": 900007,
+      "person": {"id": 666666, "fullName": "Weird Desc Guy"},
+      "typeCode": "SC",
+      "typeDesc": "Status Change",
+      "description": "Chicago Cubs transferred RHP Weird Desc Guy to the 60-day injured list.",
+      "date": "2026-07-13",
+      "fromTeam": {"id": 112, "name": "Chicago Cubs"},
+      "toTeam": {"id": 112, "name": "Chicago Cubs"}
+    }
+  ]
+}

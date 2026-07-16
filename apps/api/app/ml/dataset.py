@@ -54,6 +54,7 @@ from app.features.offense import (
     woba,
     woba_parts,
 )
+from app.features.transactions import il_effect, il_out_asof, top_k_star_players
 
 ROLLING_DAYS = 30
 RECENT_DAYS = 7
@@ -302,6 +303,31 @@ def load_lineup_frame(engine: Engine, sport: str = "mlb") -> pd.DataFrame:
     with engine.connect() as conn:
         df = pd.read_sql(text(_LINEUP_SQL), conn, params={"sport": sport})
     df["start_time_utc"] = pd.to_datetime(df["start_time_utc"], utc=True)
+    return df
+
+
+# Raw IL/transactions moves per player (star_out_flag, §1.5). Classification is
+# NOT done in SQL: the raw text rides through so app.features.transactions owns
+# the versioned taxonomy (identical to the online builder's Python-side call).
+_TRANSACTIONS_SQL = """
+SELECT t.player_id,
+       t.type_code,
+       t.type_desc,
+       t.description,
+       t.transaction_date,
+       t.mlb_transaction_id
+FROM player_transactions t
+JOIN players p ON p.id = t.player_id
+JOIN sports s ON s.id = p.sport_id
+WHERE s.key = :sport
+ORDER BY t.transaction_date
+"""
+
+
+def load_transactions_frame(engine: Engine, sport: str = "mlb") -> pd.DataFrame:
+    """Raw player transactions for the IL replay (star_out_flag, §1.5)."""
+    with engine.connect() as conn:
+        df = pd.read_sql(text(_TRANSACTIONS_SQL), conn, params={"sport": sport})
     return df
 
 
@@ -797,8 +823,17 @@ def _merge_offense_features(
     )
 
 
+def _epoch_day(d) -> int:
+    """A python date -> integer UTC calendar days since epoch (matches
+    _utc_epoch_days), so transaction dates compare to game days on one basis."""
+    return (pd.Timestamp(d) - pd.Timestamp("1970-01-01")).days
+
+
 def _lineup_features(
-    lineup: pd.DataFrame, games: pd.DataFrame, opp_hand: dict
+    lineup: pd.DataFrame,
+    games: pd.DataFrame,
+    opp_hand: dict,
+    transactions: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Per-game lineup block (bulk twin of builder._lineup_block).
 
@@ -832,6 +867,36 @@ def _lineup_features(
                 mask = (hand_col[pos] == hand).astype(float)
                 entry[f"{hand}_{key}"] = _cum(raw[key][pos] * mask)
         players[(pid, tid)] = entry
+
+    # star_out_flag support (§1.5): the team's full batter pool (to rank the
+    # top-2) and the per-player IL move history. Independent of the lineup
+    # composition, so it is computed for every side BELOW even when no realized
+    # lineup exists — mirroring the online builder, which runs _star_out_block
+    # before its own no-snapshot early returns.
+    team_to_players: dict = {}
+    for (pid, tid), entry in players.items():
+        team_to_players.setdefault(tid, []).append((pid, entry))
+    moves_by_player: dict = {}
+    min_txn_day: int | None = None
+    if transactions is not None and len(transactions):
+        for row in transactions.itertuples(index=False):
+            tday = _epoch_day(row.transaction_date)
+            # "Archive alive as-of" keys off ANY transaction date, NOT only
+            # IL-classified ones, to match the online builder's EXISTS(any
+            # player_transactions row < event_day) gate (_star_out_block). The
+            # feed's non-IL moves (recalls/options) legitimately predate the
+            # season's first IL placement; keying min_txn_day off IL moves only
+            # would return None (bulk) where the online path returns a real 0 —
+            # a train/serve-skew parity break. So update min_txn_day BEFORE the
+            # il_effect filter below.
+            if min_txn_day is None or tday < min_txn_day:
+                min_txn_day = tday
+            effect = il_effect(row.type_code, row.type_desc, row.description)
+            if effect is None:
+                continue
+            moves_by_player.setdefault(row.player_id, []).append(
+                (tday, row.mlb_transaction_id, effect)
+            )
 
     # Realized lineup composition per (event_id, is_home): slot -> player.
     composition: dict = {}
@@ -869,13 +934,38 @@ def _lineup_features(
             for key in SUM_KEYS
         }
 
+    def _star_out_bulk(team_id, day) -> int | None:
+        # Twin of builder._star_out_block: None when the transactions archive is
+        # not alive as-of (min move date not strictly before the game day) or no
+        # established star is identifiable; else the count of top-2 batters on IL.
+        if min_txn_day is None or min_txn_day >= day:
+            return None
+        candidates = team_to_players.get(team_id)
+        if not candidates:
+            return None
+        player_sums: dict = {}
+        for pid, entry in candidates:
+            d = entry["days"]
+            hi = int(np.searchsorted(d, day, side="left"))
+            lo = int(np.searchsorted(d, day - LINEUP_BATTER_WINDOW_DAYS, side="left"))
+            player_sums[pid] = _window_sums(entry, lo, hi)
+        stars = top_k_star_players(player_sums)
+        if not stars:
+            return None
+        return sum(1 for pid in stars if il_out_asof(moves_by_player.get(pid, []), day))
+
     for i in range(len(games)):
         day = int(game_days[i])
         for side in ("home", "away"):
+            team_id = team_cols[side][i]
+            # star_out is independent of the lineup composition — set it before
+            # the no-lineup early continue (mirrors the online builder).
+            star = _star_out_bulk(team_id, day)
+            if star is not None:
+                out[f"{side}_star_out_flag"][i] = star
             comp = composition.get((event_ids[i], side == "home"))
             if not comp:
                 continue  # no realized lineup for this side: proj/top4 NaN
-            team_id = team_cols[side][i]
             hand = opp_hand.get((event_ids[i], side))
             slot_to_woba: dict = {}
             slot_to_vs_hand: dict = {}
@@ -913,6 +1003,7 @@ def _merge_lineup_features(
     lineup: pd.DataFrame | None,
     games: pd.DataFrame,
     opp_hand: dict,
+    transactions: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Attach the lineup columns; NaN block (is_confirmed=0) with no data."""
     if lineup is None or len(lineup) == 0:
@@ -923,7 +1014,9 @@ def _merge_lineup_features(
                 )
         return frame
     return frame.merge(
-        _lineup_features(lineup, games, opp_hand), on="event_id", how="left"
+        _lineup_features(lineup, games, opp_hand, transactions),
+        on="event_id",
+        how="left",
     )
 
 
@@ -970,6 +1063,7 @@ def build_training_frame(
     bullpen: pd.DataFrame | None = None,
     batting: pd.DataFrame | None = None,
     lineup: pd.DataFrame | None = None,
+    transactions: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Game rows with home_/away_ features, target and season.
 
@@ -1011,7 +1105,7 @@ def build_training_frame(
     frame = _merge_starter_features(frame, pitching)
     opp_hand = _opp_hand_map(pitching)
     frame = _merge_offense_features(frame, batting, games, opp_hand)
-    frame = _merge_lineup_features(frame, lineup, games, opp_hand)
+    frame = _merge_lineup_features(frame, lineup, games, opp_hand, transactions)
     if market == "moneyline":
         frame = _merge_bullpen_features(frame, bullpen, games)
 

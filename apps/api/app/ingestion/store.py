@@ -28,6 +28,7 @@ from app.ingestion.parsers import (
     OddsEvent,
     OddsOutcome,
     PitchingLine,
+    PlayerTransaction,
     ScheduledGame,
 )
 
@@ -61,6 +62,11 @@ BATTING_TABLE = "batting_game_logs"
 # pre-005 the lineup-archive job skips with a note while the rest of the
 # pre-game crons keep running.
 LINEUP_TABLE = "event_lineups"
+
+# Migration 006 table, reflected separately (same degradation contract):
+# pre-006 sync_transactions skips with a note and the feature layer treats
+# the archive as not-yet-alive (star_out_flag stays None).
+TRANSACTIONS_TABLE = "player_transactions"
 
 EVENT_MATCH_WINDOW = timedelta(hours=3)
 
@@ -602,6 +608,86 @@ def bulk_upsert_batting_logs(
     )
     conn.execute(stmt)
     return len(rows)
+
+
+def load_team_cache_by_mlb_id(
+    conn: Connection, t: dict[str, Table], sport_id: uuid.UUID
+) -> dict[int, uuid.UUID]:
+    """Known teams for a sport keyed by MLB stats id (from external_ids).
+
+    The transactions feed identifies teams by their MLB stats id, not name,
+    so from/to team resolution goes through this map (a miss yields NULL —
+    audit-only columns, never used by features)."""
+    teams = t["teams"]
+    rows = conn.execute(
+        select(teams.c.id, teams.c.external_ids).where(teams.c.sport_id == sport_id)
+    ).all()
+    out: dict[int, uuid.UUID] = {}
+    for row in rows:
+        mlb_id = (row.external_ids or {}).get("mlb_stats_id")
+        if mlb_id is not None:
+            out[int(mlb_id)] = row.id
+    return out
+
+
+def bulk_upsert_transactions(
+    conn: Connection,
+    t: dict[str, Table],
+    rows: list[PlayerTransaction],
+    player_cache: dict[int, uuid.UUID],
+    team_by_mlb_id: dict[int, uuid.UUID],
+) -> int:
+    """Upsert raw player transactions (migration 006, docs/04 §1.5).
+
+    Idempotent by the feed's natural key ``mlb_transaction_id`` (DO UPDATE:
+    the feed occasionally re-emits a corrected move). ``player_cache`` must
+    already contain every row's player (the job upserts players from the same
+    batch first, exactly like sync_lineups). from/to team resolve through
+    ``team_by_mlb_id``; a miss is NULL (audit-only, features do not use it).
+    """
+    if not rows:
+        return 0
+    txns = t["player_transactions"]
+    # Dedupe within the batch by the natural key: a single range call can list
+    # the same transaction id once, but ON CONFLICT with duplicate values in
+    # one INSERT would error ("cannot affect row a second time").
+    deduped: dict[int, PlayerTransaction] = {}
+    for r in rows:
+        deduped[r.mlb_transaction_id] = r
+    values = [
+        {
+            "mlb_transaction_id": r.mlb_transaction_id,
+            "player_id": player_cache[r.mlb_person_id],
+            "from_team_id": (
+                team_by_mlb_id.get(r.from_team_mlb_id)
+                if r.from_team_mlb_id is not None
+                else None
+            ),
+            "to_team_id": (
+                team_by_mlb_id.get(r.to_team_mlb_id)
+                if r.to_team_mlb_id is not None
+                else None
+            ),
+            "type_code": r.type_code,
+            "type_desc": r.type_desc,
+            "description": r.description,
+            "transaction_date": r.transaction_date,
+        }
+        for r in deduped.values()
+    ]
+    stmt = pg_insert(txns).values(values)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["mlb_transaction_id"],
+        set_={
+            col: getattr(stmt.excluded, col)
+            for col in (
+                "player_id", "from_team_id", "to_team_id", "type_code",
+                "type_desc", "description", "transaction_date",
+            )
+        },
+    )
+    conn.execute(stmt)
+    return len(values)
 
 
 def record_probables(

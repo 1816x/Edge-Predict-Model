@@ -278,6 +278,33 @@ CREATE TABLE event_lineups (
     created_at    timestamptz NOT NULL DEFAULT now()
 );
 
+-- Raw player transactions / IL moves archived as-of (migration 006, docs/04
+-- §1.5 star_out_flag). One row per transaction from the MLB Stats API
+-- /transactions feed. The "on IL as-of date D" state is a REPLAY over these
+-- rows (the latest IL move with transaction_date strictly before D), computed
+-- in app/features/transactions.py — a stint (start, end) is never materialized
+-- here (the activation is a future event relative to the placement, so
+-- precomputing end would break as-of). The IL classification (placement vs
+-- activation) is not stored either: it lives versioned in the feature layer
+-- over type_desc + description, so a taxonomy change is a feature_version bump,
+-- not a re-backfill. transaction_date is the ANNOUNCE date (no time): the
+-- backtest cut is transaction_date < event_day (UTC), i.e. <= t-1 (docs/04
+-- §1.5). Idempotency is by the feed's natural key mlb_transaction_id (UNIQUE);
+-- from/to_team_id are audit only (features do not use them).
+CREATE TABLE player_transactions (
+    id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    mlb_transaction_id bigint UNIQUE,
+    player_id          uuid NOT NULL REFERENCES players (id),
+    from_team_id       uuid REFERENCES teams (id),
+    to_team_id         uuid REFERENCES teams (id),
+    type_code          text,
+    type_desc          text,
+    description        text,
+    transaction_date   date NOT NULL,
+    first_seen_at      timestamptz NOT NULL DEFAULT now(),
+    created_at         timestamptz NOT NULL DEFAULT now()
+);
+
 -- ============================================================================
 -- Odds snapshots (append-only)
 -- ============================================================================
@@ -485,6 +512,9 @@ CREATE INDEX idx_event_probables_event
     ON event_probables (event_id, side, first_seen_at DESC);
 CREATE INDEX idx_event_lineups_asof
     ON event_lineups (event_id, side, first_seen_at DESC);
+-- IL replay (star_out_flag, §1.5): scan a player's moves up to a cutoff date.
+CREATE INDEX idx_player_transactions_asof
+    ON player_transactions (player_id, transaction_date);
 
 -- Batting history per player (lineup block, §1.5) and per team (offense
 -- block windows, §1.2 — the online builder queries by team_id directly).

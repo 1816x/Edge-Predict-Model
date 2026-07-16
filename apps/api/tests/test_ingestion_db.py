@@ -12,6 +12,8 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import text
 
+from app.ingestion import store
+from app.ingestion.parsers import parse_transactions
 from app.jobs import snapshot_odds, sync_schedule
 
 from conftest import load_fixture
@@ -218,3 +220,85 @@ def test_odds_snapshots_are_append_only(db):
     with pytest.raises(Exception, match="append-only"):
         with db.begin() as conn:
             conn.execute(text("DELETE FROM odds_snapshots"))
+
+
+def _upsert_transactions(conn, tables, rows):
+    """Helper: upsert players from a transactions batch, then the txns —
+    the exact order the sync_transactions job runs (players first)."""
+    sport_id = store.get_sport_id(conn, tables)
+    player_cache = store.load_player_cache(conn, tables)
+    store.bulk_upsert_players(
+        conn, tables, sport_id,
+        [
+            {"mlb_person_id": r.mlb_person_id, "full_name": r.full_name, "pitch_hand": None}
+            for r in rows
+        ],
+        player_cache,
+    )
+    team_by_mlb_id = store.load_team_cache_by_mlb_id(conn, tables, sport_id)
+    return store.bulk_upsert_transactions(conn, tables, rows, player_cache, team_by_mlb_id)
+
+
+def test_bulk_upsert_transactions_idempotent_and_resolves_teams(db):
+    tables = store.reflect_tables(
+        db, ("sports", "teams", "players", "player_transactions")
+    )
+    rows = list(parse_transactions(load_fixture("mlb_transactions.json")).rows)
+    with db.begin() as conn:
+        sport_id = store.get_sport_id(conn, tables)
+        # Yankees (147) exists with its MLB id; Angels/Cubs do NOT — a from/to
+        # team that is unknown resolves to NULL (audit-only, never fabricated).
+        store.get_or_create_team(conn, tables, sport_id, "New York Yankees", 147)
+        store.get_or_create_team(conn, tables, sport_id, "Boston Red Sox", 111)
+
+    with db.begin() as conn:
+        first = _upsert_transactions(conn, tables, rows)
+    assert first == 4  # the 4 well-formed rows
+    assert _scalar(db, "SELECT count(*) FROM player_transactions") == 4
+    # Auto-upserted a player who may never appear in a boxscore (season on IL).
+    assert _scalar(
+        db, "SELECT count(*) FROM players WHERE mlb_person_id = 592450"
+    ) == 1
+    # Judge's from_team resolves to the Yankees row; a known team id present.
+    assert _scalar(
+        db,
+        "SELECT count(*) FROM player_transactions t JOIN teams tm "
+        "ON t.from_team_id = tm.id WHERE t.mlb_transaction_id = 900001 "
+        "AND tm.name = 'New York Yankees'",
+    ) == 1
+    # Trout's Angels (108) is unknown -> from_team_id NULL, not fabricated.
+    assert _scalar(
+        db,
+        "SELECT from_team_id FROM player_transactions WHERE mlb_transaction_id = 900002",
+    ) is None
+
+    # Re-run: idempotent by mlb_transaction_id (no duplicate rows).
+    with db.begin() as conn:
+        second = _upsert_transactions(conn, tables, rows)
+    assert second == 4
+    assert _scalar(db, "SELECT count(*) FROM player_transactions") == 4
+
+
+def test_bulk_upsert_transactions_do_update_on_correction(db):
+    tables = store.reflect_tables(
+        db, ("sports", "teams", "players", "player_transactions")
+    )
+    rows = list(parse_transactions(load_fixture("mlb_transactions.json")).rows)
+    with db.begin() as conn:
+        _upsert_transactions(conn, tables, rows)
+    # The feed re-emits transaction 900001 with a corrected description
+    # (frozen dataclass -> rebuild the one row via dataclasses.replace).
+    import dataclasses
+
+    corrected = [
+        dataclasses.replace(r, description="CORRECTED move")
+        if r.mlb_transaction_id == 900001 else r
+        for r in rows
+    ]
+    with db.begin() as conn:
+        _upsert_transactions(conn, tables, corrected)
+    assert _scalar(db, "SELECT count(*) FROM player_transactions") == 4
+    assert _scalar(
+        db,
+        "SELECT description FROM player_transactions WHERE mlb_transaction_id = 900001",
+    ) == "CORRECTED move"

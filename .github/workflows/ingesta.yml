@@ -59,6 +59,7 @@ on:
           - snapshot_odds_closing
           - backfill_results
           - backfill_pitching
+          - sync_transactions
           - audit_snapshots
           - train_f1
           - apply_migration
@@ -122,6 +123,7 @@ jobs:
               snapshot_odds_closing) python -m app.jobs.snapshot_odds --closing-window-min 30 $INPUT_ARGS ;;
               backfill_results)      python -m app.jobs.backfill_results $INPUT_ARGS ;;
               backfill_pitching)     python -m app.jobs.backfill_pitching $INPUT_ARGS ;;
+              sync_transactions)     python -m app.jobs.sync_transactions $INPUT_ARGS ;;
               audit_snapshots)       python -m app.jobs.audit_snapshots $INPUT_ARGS ;;
               train_f1)              pip install --quiet "./apps/api[ml]" && python -m app.jobs.train_f1 $INPUT_ARGS ;;
               apply_migration)       python -m app.jobs.apply_migration $INPUT_ARGS ;;
@@ -142,6 +144,7 @@ jobs:
             python -m app.jobs.sync_lineups
             python -m app.jobs.backfill_results --start-date "$START" --end-date "$YDAY"
             python -m app.jobs.backfill_pitching --start-date "$START" --end-date "$YDAY"
+            python -m app.jobs.sync_transactions --start-date "$START" --end-date "$YDAY"
             python -m app.jobs.audit_snapshots --start-date "$YDAY" --end-date "$YDAY" --fail-on-gaps
           elif [ "$SCHEDULE" = "7,37 16-23,0-3 * * *" ]; then
             python -m app.jobs.snapshot_odds --closing-window-min 30

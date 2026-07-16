@@ -62,6 +62,13 @@ LINEUP_FEATURE_NAMES = (
     "lineup_is_confirmed",
     "lineup_woba_proj",
     "top4_woba_vs_hand",
+    # Count of the team's top-2 established batters on the IL as-of the game
+    # (docs/04 §1.5, tanda F1.4). Independent of the lineup snapshot/composition
+    # (a star can be out whether or not a lineup is posted), so it is computed
+    # from the transactions archive + team batting, NOT the slot machinery. In
+    # BOTH markets (an injured star hurts full-game and F5 alike). None/NaN when
+    # the transactions archive is not alive as-of or no star is identifiable.
+    "star_out_flag",
 )
 
 

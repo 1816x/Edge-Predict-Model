@@ -108,7 +108,7 @@ def seeded(db):
         (
             "sports", "teams", "events", "event_results", "feature_snapshots",
             "players", "pitching_game_logs", "event_probables",
-            "batting_game_logs", "event_lineups",
+            "batting_game_logs", "event_lineups", "player_transactions",
         ),
     )
     ts = lambda m, d, h: datetime(2026, m, d, h, 0, tzinfo=timezone.utc)  # noqa: E731
