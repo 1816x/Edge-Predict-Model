@@ -880,12 +880,20 @@ def _lineup_features(
     min_txn_day: int | None = None
     if transactions is not None and len(transactions):
         for row in transactions.itertuples(index=False):
+            tday = _epoch_day(row.transaction_date)
+            # "Archive alive as-of" keys off ANY transaction date, NOT only
+            # IL-classified ones, to match the online builder's EXISTS(any
+            # player_transactions row < event_day) gate (_star_out_block). The
+            # feed's non-IL moves (recalls/options) legitimately predate the
+            # season's first IL placement; keying min_txn_day off IL moves only
+            # would return None (bulk) where the online path returns a real 0 —
+            # a train/serve-skew parity break. So update min_txn_day BEFORE the
+            # il_effect filter below.
+            if min_txn_day is None or tday < min_txn_day:
+                min_txn_day = tday
             effect = il_effect(row.type_code, row.type_desc, row.description)
             if effect is None:
                 continue
-            tday = _epoch_day(row.transaction_date)
-            if min_txn_day is None or tday < min_txn_day:
-                min_txn_day = tday
             moves_by_player.setdefault(row.player_id, []).append(
                 (tday, row.mlb_transaction_id, effect)
             )

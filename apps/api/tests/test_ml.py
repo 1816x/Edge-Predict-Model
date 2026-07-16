@@ -644,6 +644,15 @@ class TestStarOutFlag:
         ])
         assert self._star_out(txns) == 0.0
 
+    def test_non_il_move_alone_keeps_archive_alive_zero(self):
+        # Adversarial-review regression: the archive is "alive as-of" on ANY
+        # transaction, not only IL ones. A lone recall (il_effect None) before
+        # the game means the archive IS alive -> STAR known healthy -> a TRUE 0,
+        # matching the online builder's EXISTS-any-transaction gate. Keying
+        # liveness off IL moves only would wrongly return NaN here.
+        txns = _txn_frame([("STAR", date(2024, 4, 5), "recalled from Triple-A", 7)])
+        assert self._star_out(txns) == 0.0
+
     def test_no_qualifying_star_is_nan_even_with_il_moves(self):
         # Only a thin-sample batter exists: no established star to speak of, so
         # the flag is unknown (NaN) even though the archive is alive.
@@ -1010,3 +1019,77 @@ def test_star_out_flag_online_matches_bulk(db):
     assert online["away"]["star_out_flag"] == 1
     assert bulk_row["away_star_out_flag"] == 1
     assert online["away"]["star_out_flag"] == bulk_row["away_star_out_flag"]
+
+
+@pytest.mark.integration
+def test_star_out_flag_online_matches_bulk_non_il_liveness(db):
+    """Adversarial-review parity guard: with the ONLY transaction being a
+    non-IL move (a recall), the archive is alive as-of but the star is healthy.
+    Online and bulk must BOTH return a real 0 (not 0 vs NaN) — the exact
+    train/serve-skew the archive-alive gate fix closes."""
+    from datetime import date
+    from datetime import datetime as dt
+
+    from sqlalchemy import text
+
+    from app.features import builder
+    from app.ingestion import store
+    from app.ingestion.parsers import BattingLine, PlayerTransaction, ScheduledGame
+    from app.ml import dataset as ds
+
+    H, A = "Boston Red Sox", "New York Yankees"
+    STAR = 860001
+    tables = store.reflect_tables(db, builder.FEATURE_TABLES + ("sports", "teams"))
+    prior = dt(2026, 6, 1, 23, 0, tzinfo=timezone.utc)
+    target = dt(2026, 7, 1, 23, 0, tzinfo=timezone.utc)
+    with db.begin() as conn:
+        conn.execute(text("TRUNCATE players CASCADE"))
+        sport_id = store.get_sport_id(conn, tables)
+        gp, _ = store.upsert_event_from_schedule(
+            conn, tables, sport_id,
+            ScheduledGame(game_pk=860100, start_time=prior, status="final",
+                          home_name=A, away_name=H, home_mlb_id=147, away_mlb_id=111,
+                          home_probable=None, away_probable=None))
+        gt, _ = store.upsert_event_from_schedule(
+            conn, tables, sport_id,
+            ScheduledGame(game_pk=860101, start_time=target, status="scheduled",
+                          home_name=H, away_name=A, home_mlb_id=111, away_mlb_id=147,
+                          home_probable=None, away_probable=None))
+        cache = store.load_player_cache(conn, tables)
+        store.bulk_upsert_players(
+            conn, tables, sport_id,
+            [{"mlb_person_id": STAR, "full_name": "The Star", "pitch_hand": None}], cache)
+        teams = store.load_team_cache(conn, tables, sport_id)
+        store.bulk_upsert_batting_logs(
+            conn, tables, gp, teams[A], teams[H],
+            [BattingLine(mlb_person_id=STAR, full_name="The Star", is_home=True,
+                         at_bats=250, hits=80, doubles=0, triples=0, home_runs=0,
+                         walks=20, intentional_walks=0, strikeouts=0, hit_by_pitch=0,
+                         sac_flies=0, sac_bunts=0, batting_order=100,
+                         plate_appearances=None)], cache)
+        team_by_mlb = store.load_team_cache_by_mlb_id(conn, tables, sport_id)
+        # ONLY a non-IL move (recall) before the game: il_effect -> None.
+        store.bulk_upsert_transactions(
+            conn, tables,
+            [PlayerTransaction(
+                mlb_transaction_id=1, mlb_person_id=STAR, full_name="The Star",
+                from_team_mlb_id=147, to_team_mlb_id=147, type_code="SC",
+                type_desc="Status Change",
+                description="New York Yankees recalled The Star from Triple-A.",
+                transaction_date=date(2026, 6, 15))],
+            cache, team_by_mlb)
+
+    with db.connect() as conn:
+        online = builder.build_features(conn, tables, gt, "moneyline", target)
+        games_df = pd.read_sql(
+            text("SELECT id AS event_id, home_team_id, away_team_id, start_time_utc "
+                 "FROM events WHERE id = :id"),
+            conn, params={"id": str(gt)})
+    games_df["start_time_utc"] = pd.to_datetime(games_df["start_time_utc"], utc=True)
+    feats = ds._lineup_features(
+        ds.load_lineup_frame(db), games_df, {}, ds.load_transactions_frame(db))
+    bulk_row = feats.iloc[0]
+
+    # Archive alive via the recall; STAR established and healthy -> a REAL 0.
+    assert online["away"]["star_out_flag"] == 0
+    assert bulk_row["away_star_out_flag"] == 0
