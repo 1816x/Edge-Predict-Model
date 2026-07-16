@@ -136,6 +136,71 @@ de equipo marginal" (medido en train_f1 v4) en señal por-bateador.
   con `lineup_is_confirmed` como el ÚNICO campo divergente por diseño (online 1 vs bulk 0),
   excluido del match y asertado aparte.
 
+## Addenda (2026-07-16, tanda F1.4 — ingesta de transacciones/IL + `star_out_flag`)
+
+Concreta `docs/04 §1.5` (`star_out_flag`), que da el nombre pero no la fuente, el ranking
+ni la regla as-of. Ingiere una fuente NUEVA (el feed `/transactions` de la MLB Stats API);
+`closer_available_flag` (§1.4) se **difiere a una F1.4b** (ver más abajo el porqué).
+
+- **Tabla 006 = archivo CRUDO de transacciones, no "stints de IL"** (`player_transactions`,
+  migración 006, espejo del patrón append-as-of pero por-jugador/fecha, no por-evento). Un
+  registro por movimiento; el estado "en IL as-of D" se calcula por REPLAY en la capa de
+  features. No se materializa un stint `(start, end)`: la activación es un evento futuro
+  respecto a la colocación, así que precomputar el `end` violaría as-of. Idempotencia por la
+  clave natural del feed `mlb_transaction_id` (UNIQUE). Se guardan `type_code`, `type_desc` y
+  el free-text `description` crudos; la clasificación IL NO se almacena.
+- **Campo de fecha = `date` (anuncio), NO `effectiveDate`.** MLB retro-fecha `effectiveDate`
+  en las colocaciones de IL; usarlo pondría al jugador "out" antes de que el público lo
+  supiera → leak. La regla dura as-of es `transaction_date < event_day` (día UTC) = ≤ t-1,
+  idéntica en builder (SQL) y dataset (pandas); `first_seen_at` es solo proveniencia.
+- **Clasificación IL versionada en `app/features/transactions.py` (`il_effect`), NO en la
+  tabla ni en SQL.** Así un cambio de taxonomía es un bump de `feature_version` + retrain, no
+  un re-backfill. `il_effect` matchea patrones sobre `type_desc` + `description`
+  case-insensitive: +1 (placed/transferred/sent … injured list) out, −1
+  (activated/reinstated … injured list) back, None si no es IL. **Reconoce las DOS
+  denominaciones históricas: "injured list" (2019+) y "disabled list" (pre-2019)** — el
+  backfill abarca 2018, cuando aún no se renombraba; un matcher solo-"injured list" perdería
+  una temporada entera en silencio. El job `sync_transactions` reporta el canario
+  `il_desc_unclassified` (menciones de IL/DL que no clasifican) para visibilidad de drift.
+- **`star_out_flag` = cuenta 0/1/2** de los **top-2 bateadores establecidos** del equipo en
+  IL as-of `event_day−1`. Top-2 por `batter_woba_asof` (misma wOBA shrunk 365d del bloque
+  lineup) entre los que superan `LINEUP_STAR_MIN_PA = 200` (medido por el denominador de
+  wOBA, ya computado en ambos paths → paridad gratis), tiebreak `(wOBA desc, str(player_id))`
+  idéntico en los dos paths. **Es IL-based, no lineup-absence** (esa variante sería circular
+  con `lineup_woba_proj` y no usaría la fuente nueva). Entra a AMBOS mercados (un star
+  lesionado pega a juego completo y a F5).
+- **None/NaN nunca un 0 fabricado**: None si el archivo de transacciones NO está vivo as-of
+  (ninguna transacción con fecha < event_day) o si no se identifica ningún star (0 bateadores
+  ≥200 PA); **0** solo si el archivo está vivo, los top-2 se conocen y ninguno está out.
+- **Replay parity-safe** (`il_out_asof`, `top_k_star_players` en `transactions.py`, llamados
+  por builder y dataset): `star_out_flag` es independiente del snapshot/composición del
+  lineup, así que se computa ANTES de los early-returns de `_lineup_block` (online) y del
+  `if not comp: continue` de `_lineup_features` (bulk). Doubleheader-seguro (regla puramente
+  day-based → ambos juegos comparten `event_day`).
+- **Señal histórica REAL** (a diferencia de `lineup_is_confirmed`, constante-0 en backtest):
+  el backfill carga IL reales 2018–2026, variable por fecha/equipo → `star_out_flag` varía
+  0/1/2 en el walk-forward. **Sesgos documentados**: (1) `date ≤ t-1` trata una IL same-day
+  como desconocida → leve sesgo optimista, simétrico a §1.3/§1.5, uniforme también en
+  producción; (2) redundancia PARCIAL con `lineup_woba_proj` en el backtest de lineup
+  realizado (un star en IL ya está ausente de la composición realizada), así que la mejora
+  walk-forward puede ser marginal — su pago REAL es forward (producción con lineups no
+  confirmados, donde una IL recién anunciada sí se captura por la regla de fecha). No se
+  promete mejora: se mide.
+- **`closer_available_flag` (§1.4) DIFERIDO a F1.4b.** `pitching_game_logs` no almacena
+  saves/entradas/leverage, así que la identidad del cerrador solo es proxyeable de forma
+  ruidosa (el ranking por IP selecciona long-men, lo contrario a un closer). Su valor
+  incremental sobre la fatiga colectiva ya cubierta (`bullpen_ip_l3d`/`b2b_flag`) es incierto
+  y no validable antes de que abra el gate. Si se hace, será la variante honesta "depleción
+  del bullpen por IL" (top-K brazos de calidad por xFIP-30d en IL as-of t-1, solo Moneyline),
+  NO identidad de cerrador. El archivo de IL de esta tanda lo deja barato de construir cuando
+  el gate diga que vale la pena.
+- **Verificación de red bloqueada**: la política de egress de la sesión de desarrollo bloquea
+  `statsapi.mlb.com`, así que el smoke en vivo del endpoint NO se pudo correr localmente. Se
+  mitigó guardando el `description` crudo (el detalle de IL suele venir ahí con
+  `typeCode="SC"`), matcheando sobre ambos campos, y el canario `il_desc_unclassified`; el
+  smoke real es el primer dispatch de `sync_transactions` en Actions (rango chico) cuyo
+  summary se revisa antes del backfill histórico completo.
+
 ## Principios no negociables (del brief original)
 
 - No se promete rentabilidad. El producto vende claridad, control de riesgo y trazabilidad.

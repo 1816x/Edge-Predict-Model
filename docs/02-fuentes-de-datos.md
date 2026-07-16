@@ -231,6 +231,12 @@ respuesta) en cada ingesta y alertar si el ritmo proyectado supera el 80% del pl
   suficiente para el MVP: no necesitamos rumores, necesitamos hechos confirmados
   as-of (regla anti-leakage del brief: el backtest solo puede usar lo que era público
   antes del primer pitch, con timestamp).
+  **Ya ingerido (tanda F1.4, 2026-07-16)**: el job `sync_transactions` archiva el feed
+  crudo en `player_transactions` (migración 006) y el bloque de lineup deriva
+  `star_out_flag` (§1.5, `docs/00` addendum). Nota as-of importante: las transacciones
+  históricas de este endpoint traen **fecha sin hora**, así que el corte conservador del
+  backtest es `date ≤ t-1` (una IL anunciada el mismo día del juego se trata como
+  desconocida); y se usa el campo `date` (anuncio), no `effectiveDate` (retro-fechado).
 - **Lineups confirmados**: aparecen en el boxscore/live feed del juego cuando los
   clubes los publican, típicamente **~1–4 horas antes del primer pitch** (varía por
   equipo y por juego día/noche).

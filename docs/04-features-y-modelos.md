@@ -155,6 +155,16 @@ aprender a ser menos agresivo cuando el flag es falso — eso es una virtud, no 
   y paper trading no tienen este sesgo. Como en el backtest `is_confirmed` es constante-0,
   no aporta señal entrenable hasta que ese archivo madure — se conserva por honestidad.
 
+**Implementación de `star_out_flag` (tanda F1.4, detalle en `docs/00` addendum 2026-07-16):**
+ingiere la fuente NUEVA de transacciones/IL (feed `/transactions` de la MLB Stats API,
+tabla `player_transactions`, migración 006, job `sync_transactions`). `star_out_flag` es la
+cuenta 0/1/2 de los top-2 bateadores establecidos (≥200 PA, por wOBA as-of) del equipo en IL
+as-of `event_day−1` (replay del último movimiento IL con `date < event_day`; corte ≤ t-1
+porque la fecha viene sin hora). IL-based, no lineup-absence; ambos mercados; None/NaN
+(nunca 0) sin archivo vivo o sin star identificable. El clasificador IL reconoce "injured
+list" (2019+) y "disabled list" (pre-2019). `closer_available_flag` (§1.4) queda diferido a
+F1.4b (ver addendum).
+
 ### 1.6 Bloque: park factors
 
 | Feature | Definición | Ventana | Regla as-of |
