@@ -34,6 +34,22 @@ from app.features.offense import woba_parts
 LINEUP_STAR_TOP_K = 2
 LINEUP_STAR_MIN_PA = 200.0
 
+# bullpen_il_depletion (docs/04 §1.4b): the count of a team's top-K QUALITY
+# relievers (ranked by xFIP-30d) who are on the IL as-of the game. "Quality" is
+# by the SAME reliever xFIP the bullpen block already computes (lower = better);
+# the establishment gate is reliever OUTS in the 30d window, which both paths
+# already sum for that xFIP, so no separate sample stat is needed and parity is
+# free. MONEYLINE only (leverage relievers do not pitch innings 1-5). The
+# ranking window is xFIP-30d as docs/00 specifies: it detects the IL of
+# recently-active quality arms (incl. a just-announced move, the forward
+# payoff), NOT long-duration IL (already priced by the collective-fatigue
+# block). A quality arm on the IL beyond ~3 weeks has an empty 30d sample and
+# falls out of the pool BY DESIGN — this also keeps the pool to currently-active
+# arms, so a traded/role-changed reliever cannot be a false positive
+# (decision registered in docs/00-decisiones.md, addendum 2026-07-19).
+BULLPEN_IL_TOP_K = 3
+BULLPEN_IL_MIN_OUTS = 9.0  # >= 3.0 IP of relief in the 30d window = established
+
 # The status list has two historical names for the SAME thing: MLB renamed the
 # Disabled List to the Injured List in 2019. The 2018 backfill sees "disabled
 # list"; everything from 2019 on sees "injured list". Both must classify.
@@ -118,4 +134,33 @@ def top_k_star_players(
             continue
         ranked.append((woba, str(player_id), player_id))
     ranked.sort(key=lambda r: (-r[0], r[1]))
+    return [player_id for _, _, player_id in ranked[:k]]
+
+
+def top_k_bullpen_arms(
+    player_xfips: dict,
+    k: int = BULLPEN_IL_TOP_K,
+    min_outs: float = BULLPEN_IL_MIN_OUTS,
+) -> list:
+    """The team's top-K quality relievers by xFIP-30d (LOWER = better), as-of.
+
+    ``player_xfips`` maps player_id -> ``(xfip_30d, sample_outs)``: both are
+    computed by the caller over that reliever's lines windowed to
+    ``[event_day-30, event_day-1]`` with the SAME ``_xfip_core`` math the
+    ``bullpen_xfip_30d`` block already mirrors online and bulk — this shared
+    helper owns only the drift-prone part (the establishment gate, the ordering
+    and the tie-break), so the value stays single-sourced per path. An arm must
+    clear ``min_outs`` reliever outs in the window to be an ESTABLISHED arm — a
+    mop-up cameo never counts (measured by the same ``outs`` denominator the
+    xFIP already uses, so parity is free, exactly like ``top_k_star_players``
+    gates on the wOBA denominator). Ranked ASCENDING by xfip (lower is better),
+    tie-broken by ``str(player_id)`` so the online and bulk paths pick the SAME
+    arms. Returns up to k player_ids (fewer, or empty, when the team has fewer
+    qualifying relievers as-of)."""
+    ranked = []
+    for player_id, (xfip, outs) in player_xfips.items():
+        if xfip is None or outs < min_outs:
+            continue
+        ranked.append((xfip, str(player_id), player_id))
+    ranked.sort(key=lambda r: (r[0], r[1]))
     return [player_id for _, _, player_id in ranked[:k]]

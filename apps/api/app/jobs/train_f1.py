@@ -58,6 +58,21 @@ def _bullpen_coverage(frame) -> float:
     return round(float(both.mean()), 4) if len(frame) else 0.0
 
 
+def _bullpen_il_coverage(frame) -> float:
+    """Share of rows where BOTH teams carry a real bullpen_il_depletion
+    (docs/04 §1.4b, Moneyline only).
+
+    Lower than bullpen coverage BY DESIGN: the count is None until THREE gates
+    hold as-of — the reliever archive is alive, the transactions archive is
+    alive, and the team has an established (>=3 IP in 30d) quality arm to rank —
+    so a hole never reads as a fabricated 0."""
+    both = (
+        frame["home_bullpen_il_depletion"].notna()
+        & frame["away_bullpen_il_depletion"].notna()
+    )
+    return round(float(both.mean()), 4) if len(frame) else 0.0
+
+
 def _offense_coverage(frame) -> float:
     """Share of rows where BOTH teams carry a real 30d offense window."""
     both = frame["home_team_woba_30d"].notna() & frame["away_team_woba_30d"].notna()
@@ -166,7 +181,8 @@ def run(
         )
 
     # Transactions/IL archive has its own try (migration 006 is newer): pre-006
-    # the report still trains, only star_out_flag degrades to NaN.
+    # the report still trains, only star_out_flag and bullpen_il_depletion
+    # degrade to NaN.
     transactions = None
     try:
         transactions = load_transactions_frame(engine)
@@ -175,7 +191,8 @@ def run(
     except (ProgrammingError, DatabaseError):
         out["transactions_note"] = (
             "player_transactions missing; apply migration 006 and run "
-            "sync_transactions (star_out_flag is all NaN this run)"
+            "sync_transactions (star_out_flag and bullpen_il_depletion are all "
+            "NaN this run)"
         )
 
     for market in markets:
@@ -206,6 +223,10 @@ def run(
         }
         if market == "moneyline":
             block["bullpen_coverage"] = _bullpen_coverage(frame)
+            # bullpen_il_depletion coverage (§1.4b, Moneyline only): fraction
+            # with the reliever archive, the IL archive AND a rankable arm all
+            # live as-of; lower than bullpen_coverage by design.
+            block["bullpen_il_coverage"] = _bullpen_il_coverage(frame)
         out["markets"][market] = block
     return out
 
@@ -225,6 +246,8 @@ def _markdown_summary(result: dict[str, Any]) -> str:
         )
         if "bullpen_coverage" in block:
             coverage += f", bullpen_coverage {block['bullpen_coverage']}"
+        if "bullpen_il_coverage" in block:
+            coverage += f", bullpen_il_coverage {block['bullpen_il_coverage']}"
         lines.append(
             f"### {market} — {block['rows']} juegos, temporadas {block['seasons']}, "
             f"{coverage}"

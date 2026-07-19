@@ -274,7 +274,13 @@ class TestBullpenFeatures:
         f5 = ds.build_training_frame(games, "f5_moneyline")
         ml = ds.build_training_frame(games, "moneyline")
         assert not any("bullpen" in c for c in f5.columns)
-        assert sum("bullpen" in c for c in ml.columns) == 8
+        # 5 bullpen features per side (Moneyline only): ip_l3d, b2b_flag,
+        # xfip_30d, ip_expected, il_depletion (§1.4b, F1.4b).
+        assert sum("bullpen" in c for c in ml.columns) == 10
+        # bullpen_il_depletion (§1.4b) is Moneyline only: present in ML, absent
+        # from F5 (the whole bullpen block is excluded from F5 by design).
+        assert sum("bullpen_il_depletion" in c for c in ml.columns) == 2
+        assert sum("bullpen_il_depletion" in c for c in f5.columns) == 0
         # The offense block (docs/04 §1.2) enters BOTH vectors: 7 per side.
         assert sum("team_woba" in c or "team_ops" in c or "team_iso" in c
                    or "team_k_pct" in c or "team_bb_pct" in c for c in f5.columns) == 14
@@ -284,7 +290,7 @@ class TestBullpenFeatures:
         # star_out_flag (§1.5, F1.4) enters BOTH vectors too: 1 per side.
         assert sum("star_out_flag" in c for c in ml.columns) == 2
         assert sum("star_out_flag" in c for c in f5.columns) == 2
-        assert len(ds.FEATURE_COLUMNS) == 62
+        assert len(ds.FEATURE_COLUMNS) == 64
         assert len(ds.F5_FEATURE_COLUMNS) == 54
         assert ds.feature_columns("f5_moneyline") == ds.F5_FEATURE_COLUMNS
 
@@ -738,7 +744,8 @@ def test_markdown_summary_renders_every_model_column():
                 "rows": int(len(frame)), "seasons": [2018, 2023],
                 "sp_coverage": 0.0, "offense_coverage": 0.0,
                 "lineup_coverage": 0.0, "star_out_coverage": 0.0,
-                "bullpen_coverage": 0.0, "rows_with_market_prior": 0,
+                "bullpen_coverage": 0.0, "bullpen_il_coverage": 0.0,
+                "rows_with_market_prior": 0,
                 "report": report,
             }
         },
@@ -810,6 +817,11 @@ def test_train_f1_job_reports_sp_coverage(seeded):
     # Reliever archive comes alive after June 5th: 4 of 5 games covered.
     assert block["bullpen_coverage"] == 0.8
     assert "bullpen_coverage" not in result["markets"]["f5_moneyline"]
+    # bullpen_il_depletion coverage is 0: the seed has no transactions archive,
+    # so the count is honestly None everywhere (Moneyline only, never a
+    # fabricated 0), and no migration-006 note fires (the table exists, empty).
+    assert block["bullpen_il_coverage"] == 0.0
+    assert "bullpen_il_coverage" not in result["markets"]["f5_moneyline"]
     # Offense: e900001/e900002/e900004 have both teams with a real 30d
     # batting window; e900003 predates the archive and e900005's home team
     # (A) never bats in the seeds.
@@ -828,9 +840,10 @@ def test_train_f1_job_reports_sp_coverage(seeded):
 @pytest.mark.integration
 def test_train_f1_degrades_without_migration_006(seeded):
     """Pre-006 window: train_f1 still trains on everything else and only
-    star_out_flag degrades to NaN (pandas wraps the missing-table error in its
-    own DatabaseError, not sqlalchemy's ProgrammingError — the exact gotcha
-    the batting/lineup degradation already learned)."""
+    star_out_flag and bullpen_il_depletion degrade to NaN (pandas wraps the
+    missing-table error in its own DatabaseError, not sqlalchemy's
+    ProgrammingError — the exact gotcha the batting/lineup degradation already
+    learned)."""
     from pathlib import Path
 
     from sqlalchemy import text as sql_text
@@ -847,6 +860,7 @@ def test_train_f1_degrades_without_migration_006(seeded):
         block = result["markets"]["moneyline"]
         assert block["sp_coverage"] == 0.2
         assert block["star_out_coverage"] == 0.0  # all NaN, honest 0 coverage
+        assert block["bullpen_il_coverage"] == 0.0  # all NaN, honest 0 coverage
     finally:
         migration = (
             Path(__file__).parents[3] / "infra" / "migrations"
@@ -913,6 +927,10 @@ def test_bulk_features_match_online_builder(seeded):
         # online==bulk check is test_star_out_flag_online_matches_bulk).
         "star_out_flag",
         *ds.SP_FEATURE_NAMES,
+        # BP_FEATURE_NAMES includes bullpen_il_depletion (§1.4b): here it is
+        # None==NaN (the seed archives no transactions), a vacuous pass like
+        # star_out_flag — the real non-vacuous online==bulk check is
+        # test_bullpen_il_depletion_online_matches_bulk.
         *ds.BP_FEATURE_NAMES,
     ):
         for side in ("home", "away"):
@@ -1093,3 +1111,125 @@ def test_star_out_flag_online_matches_bulk_non_il_liveness(db):
     # Archive alive via the recall; STAR established and healthy -> a REAL 0.
     assert online["away"]["star_out_flag"] == 0
     assert bulk_row["away_star_out_flag"] == 0
+
+
+def _seed_bullpen_il_scenario(db, *, reliever_outs, txn_description):
+    """Seed a target game (H home, A away) where team A's lone established
+    reliever RSTAR recorded ``reliever_outs`` relief outs inside the 30d window
+    and has one transaction (``txn_description``) dated before the game. Returns
+    ``(online_features, bulk_row)`` for the target so a test can compare the
+    away side (team A) across the online SQL block and the bulk pandas twin."""
+    from datetime import date
+    from datetime import datetime as dt
+
+    from sqlalchemy import text
+
+    from app.features import builder
+    from app.ingestion import store
+    from app.ingestion.parsers import PitchingLine, PlayerTransaction, ScheduledGame
+    from app.ml import dataset as ds
+
+    H, A = "Boston Red Sox", "New York Yankees"
+    RSTAR = 870001
+    tables = store.reflect_tables(db, builder.FEATURE_TABLES + ("sports", "teams"))
+    # RSTAR pitches Jun 10 (inside the 30d window [Jun 1, Jul 1)), is placed on
+    # IL Jun 20 (< target day), target is Jul 1: a recently-placed quality arm.
+    pitched = dt(2026, 6, 10, 23, 0, tzinfo=timezone.utc)
+    target = dt(2026, 7, 1, 23, 0, tzinfo=timezone.utc)
+    with db.begin() as conn:
+        conn.execute(text("TRUNCATE players CASCADE"))
+        sport_id = store.get_sport_id(conn, tables)
+        gp, _ = store.upsert_event_from_schedule(
+            conn, tables, sport_id,
+            ScheduledGame(game_pk=870100, start_time=pitched, status="final",
+                          home_name=A, away_name=H, home_mlb_id=147, away_mlb_id=111,
+                          home_probable=None, away_probable=None))
+        gt, _ = store.upsert_event_from_schedule(
+            conn, tables, sport_id,
+            ScheduledGame(game_pk=870101, start_time=target, status="scheduled",
+                          home_name=H, away_name=A, home_mlb_id=111, away_mlb_id=147,
+                          home_probable=None, away_probable=None))
+        cache = store.load_player_cache(conn, tables)
+        store.bulk_upsert_players(
+            conn, tables, sport_id,
+            [{"mlb_person_id": RSTAR, "full_name": "Setup Ace", "pitch_hand": "R"}], cache)
+        teams = store.load_team_cache(conn, tables, sport_id)
+        # A quality relief line for A (home of gp): is_starter=False so it drives
+        # the reliever archive and the xFIP-30d ranking, not the starter block.
+        store.bulk_upsert_pitching_logs(
+            conn, tables, gp, teams[A], teams[H],
+            [PitchingLine(mlb_person_id=RSTAR, full_name="Setup Ace", pitch_hand="R",
+                          is_home=True, is_starter=False, outs_recorded=reliever_outs,
+                          batters_faced=reliever_outs + 2, strikeouts=6, walks=1,
+                          hit_batsmen=0, home_runs=1, fly_outs=2, ground_outs=None,
+                          sac_flies=0, pitches_thrown=40)], cache)
+        team_by_mlb = store.load_team_cache_by_mlb_id(conn, tables, sport_id)
+        store.bulk_upsert_transactions(
+            conn, tables,
+            [PlayerTransaction(
+                mlb_transaction_id=1, mlb_person_id=RSTAR, full_name="Setup Ace",
+                from_team_mlb_id=147, to_team_mlb_id=147, type_code="SC",
+                type_desc="Status Change", description=txn_description,
+                transaction_date=date(2026, 6, 20))], cache, team_by_mlb)
+
+    with db.connect() as conn:
+        online = builder.build_features(conn, tables, gt, "moneyline", target)
+        games_df = pd.read_sql(
+            text("SELECT id AS event_id, home_team_id, away_team_id, start_time_utc "
+                 "FROM events WHERE id = :id"),
+            conn, params={"id": str(gt)})
+    games_df["start_time_utc"] = pd.to_datetime(games_df["start_time_utc"], utc=True)
+    feats = ds._bullpen_features(
+        ds.load_bullpen_frame(db), games_df, ds.load_transactions_frame(db))
+    return online, feats.iloc[0]
+
+
+@pytest.mark.integration
+def test_bullpen_il_depletion_online_matches_bulk(db):
+    """A quality reliever on the IL: the online builder (_bullpen_il_block, SQL)
+    and the bulk dataset (_bullpen_features, pandas) must produce the SAME
+    bullpen_il_depletion — a REAL non-vacuous value, this feature's parity guard."""
+    online, bulk_row = _seed_bullpen_il_scenario(
+        db,
+        reliever_outs=9,  # exactly BULLPEN_IL_MIN_OUTS: established (boundary case)
+        txn_description="New York Yankees placed Setup Ace on the 15-day injured list.",
+    )
+    # A is the AWAY team of the target; its lone established reliever is on IL.
+    assert online["away"]["bullpen_il_depletion"] == 1
+    assert bulk_row["away_bullpen_il_depletion"] == 1
+    assert (
+        online["away"]["bullpen_il_depletion"]
+        == bulk_row["away_bullpen_il_depletion"]
+    )
+    # H (home) archived no relievers: no rankable arm -> None/NaN, never a 0.
+    assert online["home"]["bullpen_il_depletion"] is None
+    assert pd.isna(bulk_row["home_bullpen_il_depletion"])
+
+
+@pytest.mark.integration
+def test_bullpen_il_depletion_non_il_liveness(db):
+    """Adversarial-review parity guard (twin of the star_out one): with the ONLY
+    transaction a non-IL move (a recall), the archive is alive as-of but the arm
+    is healthy. Online and bulk must BOTH return a real 0 (not 0 vs NaN) — the
+    exact train/serve-skew the archive-alive gate closes."""
+    online, bulk_row = _seed_bullpen_il_scenario(
+        db,
+        reliever_outs=9,
+        txn_description="New York Yankees recalled Setup Ace from Triple-A.",
+    )
+    assert online["away"]["bullpen_il_depletion"] == 0
+    assert bulk_row["away_bullpen_il_depletion"] == 0
+
+
+@pytest.mark.integration
+def test_bullpen_il_depletion_below_min_outs_is_none(db):
+    """A reliever below the min-outs establishment gate (a mop-up cameo) is not
+    rankable: no arm qualifies, so the count is None/NaN (unknown) — never a
+    fabricated 0 — identically in both paths."""
+    online, bulk_row = _seed_bullpen_il_scenario(
+        db,
+        reliever_outs=6,  # < BULLPEN_IL_MIN_OUTS (9 outs / 3.0 IP): below the gate
+        txn_description="New York Yankees placed Setup Ace on the 15-day injured list.",
+    )
+    assert online["away"]["bullpen_il_depletion"] is None
+    assert pd.isna(bulk_row["away_bullpen_il_depletion"])

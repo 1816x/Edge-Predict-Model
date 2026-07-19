@@ -29,10 +29,16 @@ own archive:
   honest lineup_is_confirmed flag. No archived snapshot -> the block is None
   with is_confirmed=0; the online path never reads the realized box-score
   order. Formulas shared with the bulk path via app/features/lineup.py.
+- IL / transactions (§1.5, §1.4b), from the transactions archive (migration
+  006) plus the batting/reliever archives: star_out_flag (§1.5, BOTH markets)
+  counts the team's top-2 batters on the IL as-of; bullpen_il_depletion
+  (§1.4b, MONEYLINE ONLY) counts the team's top-K quality relievers (by
+  xFIP-30d) on the IL as-of — the honest reformulation of
+  closer_available_flag, NOT closer identity. Both are None (never a
+  fabricated 0) without a live archive as-of. Classifier and replay shared
+  with the bulk path via app/features/transactions.py.
 
 NOT implemented yet (no placeholder numbers are fabricated for them):
-- closer_available_flag (§1.4) and star_out_flag (§1.5): need
-  transactions/IL ingest
 - park factors (§1.6) and weather (§1.7): TODO(F1)
 - TTO decay and fastball velocity delta (§1.3): TODO(F1.1) — need
   play-by-play / Statcast sources.
@@ -75,7 +81,12 @@ from app.features.offense import (
     woba,
     woba_parts,
 )
-from app.features.transactions import il_effect, il_out_asof, top_k_star_players
+from app.features.transactions import (
+    il_effect,
+    il_out_asof,
+    top_k_bullpen_arms,
+    top_k_star_players,
+)
 
 ROLLING_WINDOW = timedelta(days=30)
 RECENT_WINDOW = timedelta(days=7)
@@ -120,6 +131,7 @@ BP_FEATURES = (
     "bullpen_b2b_flag",
     "bullpen_xfip_30d",
     "bullpen_ip_expected",
+    "bullpen_il_depletion",
 )
 
 FEATURE_TABLES = (
@@ -431,6 +443,92 @@ def _bullpen_block(
             )
         )
     return block
+
+
+def _bullpen_il_block(
+    conn: Connection,
+    t: dict[str, Table],
+    team_id: uuid.UUID,
+    event_day,
+    league_bp: dict[str, float] | None,
+) -> int | None:
+    """Count of the team's top-K quality relievers on the IL as-of (§1.4b).
+
+    The honest reformulation of the deferred ``closer_available_flag``: it does
+    NOT identify the closer (we store no saves/leverage). It ranks the team's
+    relievers by the SAME xFIP-30d the bullpen block already uses (lower is
+    better), takes the top ``BULLPEN_IL_TOP_K`` established arms, and counts how
+    many are on the IL as-of ``date < event_day`` (<= t-1). MONEYLINE only.
+
+    None (never a fabricated 0) when ANY gate is not satisfiable as-of: the
+    reliever archive is not alive (``league_bp is None`` — same gate as
+    ``_bullpen_block``), the transactions archive is not alive (identical to
+    ``_star_out_block``), or no reliever clears the min-outs establishment gate.
+    A real 0 means all three gates pass, the top-K are known, and none is out.
+    Structurally the twin of ``_star_out_block`` (relievers-by-xFIP instead of
+    top-2 batters-by-wOBA), and independent of the fatigue block above."""
+    if league_bp is None:
+        return None
+    txns = t["player_transactions"]
+    alive = conn.execute(
+        select(txns.c.id).where(txns.c.transaction_date < event_day).limit(1)
+    ).first()
+    if alive is None:
+        return None  # transactions archive not alive as-of: unknown, not a 0
+
+    events, logs = t["events"], t["pitching_game_logs"]
+    day = _utc_day_expr(events)
+    rows = conn.execute(
+        select(
+            logs.c.player_id.label("player_id"),
+            func.sum(logs.c.strikeouts).label("k"),
+            func.sum(logs.c.walks + logs.c.hit_batsmen).label("bb_hbp"),
+            func.sum(_fb_expr(logs)).label("fb"),
+            func.sum(logs.c.outs_recorded).label("outs"),
+        )
+        .select_from(logs.join(events, events.c.id == logs.c.event_id))
+        .where(
+            logs.c.team_id == team_id,
+            ~logs.c.is_starter,
+            day >= event_day - timedelta(days=BULLPEN_QUALITY_DAYS),
+            day < event_day,
+        )
+        .group_by(logs.c.player_id)
+    ).all()
+    player_xfips = {
+        r.player_id: (
+            _xfip_core(
+                r.k, r.bb_hbp, r.fb, r.outs / 3.0,
+                league_bp["lg_hrfb"], league_bp["lg_xfip_core"],
+            ),
+            float(r.outs),
+        )
+        for r in rows
+        if r.outs
+    }
+    arms = top_k_bullpen_arms(player_xfips)
+    if not arms:
+        return None  # no established reliever identifiable as-of: unknown, not 0
+
+    tx_rows = conn.execute(
+        select(
+            txns.c.player_id,
+            txns.c.type_code,
+            txns.c.type_desc,
+            txns.c.description,
+            txns.c.transaction_date,
+            txns.c.mlb_transaction_id,
+        ).where(txns.c.player_id.in_(arms), txns.c.transaction_date < event_day)
+    ).all()
+    moves: dict[Any, list] = {}
+    for r in tx_rows:
+        effect = il_effect(r.type_code, r.type_desc, r.description)
+        if effect is None:
+            continue
+        moves.setdefault(r.player_id, []).append(
+            (r.transaction_date, r.mlb_transaction_id, effect)
+        )
+    return sum(1 for pid in arms if il_out_asof(moves.get(pid, []), event_day))
 
 
 def _offense_block(
@@ -843,6 +941,11 @@ def build_features(
             sides[side].update(
                 _bullpen_block(conn, t, team_id, event_day, league_bp)
             )
+            # bullpen_il_depletion (§1.4b): integer count (0..K) or None — NOT
+            # rounded. Independent of the fatigue block; same league_bp gate.
+            sides[side]["bullpen_il_depletion"] = _bullpen_il_block(
+                conn, t, team_id, event_day, league_bp
+            )
     else:
         for side in sides:
             sides[side].pop("bullpen_ip_expected")
@@ -851,14 +954,13 @@ def build_features(
     # column, and keeping it out lets identical vectors captured at different
     # times dedupe on (event, market, feature_hash) as the schema intends.
     return {
-        "feature_version": "team_form_sp_bp_off_lineup_star_v6",
+        "feature_version": "team_form_sp_bp_off_lineup_star_bpil_v7",
         "market": market,
         "home": sides["home"],
         "away": sides["away"],
-        # TODO(F1): park, weather blocks (docs/04 §1.6-1.7),
-        # closer_available_flag and star_out_flag (§1.4-1.5, need
-        # transactions/IL ingest) and TTO/velocity (§1.3). Absent on
-        # purpose — never fabricated.
+        # TODO(F1): park, weather blocks (docs/04 §1.6-1.7) and TTO/velocity
+        # (§1.3, needs play-by-play / Statcast). Absent on purpose — never
+        # fabricated.
     }
 
 

@@ -201,6 +201,55 @@ ni la regla as-of. Ingiere una fuente NUEVA (el feed `/transactions` de la MLB S
   smoke real es el primer dispatch de `sync_transactions` en Actions (rango chico) cuyo
   summary se revisa antes del backfill histórico completo.
 
+## Addenda (2026-07-19, tanda F1.4b — `bullpen_il_depletion`)
+
+Concreta la variante honesta de `closer_available_flag` que el addendum del 2026-07-16
+dejó diferida y ya especificada: **"depleción del bullpen por IL"**. NO ingiere fuente
+nueva ni migración — reusa el archivo de IL (`player_transactions`, migración 006,
+backfill 2018-2026 limpio), las líneas de relevistas de `pitching_game_logs`
+(`NOT is_starter`) y la matemática de xFIP de relevistas (`_xfip_core`) ya en producción.
+
+- **`bullpen_il_depletion` = cuenta 0..K de los top-K brazos de calidad del bullpen (por
+  xFIP-30d) en IL as-of `date < event_day` (≤ t-1), SOLO Moneyline.** Es el gemelo
+  estructural de `star_out_flag` (cambia "top-2 bateadores por wOBA-365d" por "top-K
+  relevistas por xFIP-30d"), y explícitamente **NO identidad de cerrador** — no guardamos
+  saves/entradas/leverage, así que un cerrador no es identificable; el ranking honesto es
+  por calidad (xFIP), no por rol.
+- **Constantes (nombradas, tuneables) en `app/features/transactions.py`:** `BULLPEN_IL_TOP_K
+  = 3` (el core de leverage que mueve un Moneyline de juego completo: cerrador + ~2 setup;
+  K=5 diluye en middle relief) y `BULLPEN_IL_MIN_OUTS = 9.0` (≥3.0 IP de relevo en la
+  ventana 30d para ser un brazo *establecido*; filtra mop-up). El gate de establecimiento se
+  mide por el mismo denominador `outs` que el xFIP, así la paridad es gratis — idéntico a
+  cómo `top_k_star_players` gatea por el denominador de wOBA ≥200 PA.
+- **Ranking por xFIP-30d ascendente** (menor = mejor), tie-break `str(player_id)` idéntico
+  online/bulk. Reusa `_xfip_core` con `SP_SHRINK_IP = 15.0` y las constantes de liga de
+  relevistas de `_league_bullpen` (365d). El shrink de 15 IP estabiliza el ranking (un brazo
+  de 3 IP se jala ~83% hacia la liga → ningún fluke de muestra chica rankea #1). La fórmula
+  compartida (gate + orden + tie-break) vive en `top_k_bullpen_arms`; el VALOR xFIP lo
+  calcula cada path con su `_xfip_core` ya espejado (paridad guardada por el test).
+- **Contrato None (nunca un 0 fabricado) de TRES gates:** `None` si el archivo de relevistas
+  no está vivo as-of (`league_bp is None`, mismo gate que `_bullpen_block`), o el archivo de
+  transacciones no está vivo as-of (idéntico a `_star_out_block`), o ningún relevista pasa el
+  gate de min-outs. Un `0` real = los tres gates pasan, el top-K se conoce, y ninguno está en
+  IL. `bullpen_il_coverage` (solo Moneyline) es más baja por diseño que `bullpen_coverage`.
+- **Decisión de ventana (confirmada con el owner): xFIP-30d como especifica docs/04 §1.4,
+  NO una ventana de establecimiento larga.** Consecuencia honesta: un brazo de calidad en IL
+  por más de ~3 semanas tiene muestra 30d vacía, cae del pool y **no se cuenta** — el feature
+  detecta la IL de brazos de calidad recientemente activos (incluida la recién anunciada, el
+  pago forward), NO la IL de larga duración (que ya está en gran parte priceada por la fatiga
+  colectiva `bullpen_ip_l3d`/`b2b_flag`). Ventaja del 30d: el pool queda a brazos ACTIVOS, así
+  un relevista traspasado o con rol cambiado no puede ser falso positivo. La alternativa
+  (ventana 365d espejando `star_out`) contaría la IL larga pero necesitaría un guard extra
+  contra brazos obsoletos y desviaría del spec; se descartó.
+- **`feature_version` → `team_form_sp_bp_off_lineup_star_bpil_v7`** (bump de taxonomía, no
+  re-backfill). Columnas por-mercado 64/54 (bullpen 5 por lado en ML, F5 sin bullpen).
+- **Expectativa honesta (registrada por adelantado):** efecto modesto, mixto, probablemente
+  concentrado en `hist_gb` (explota un conteo discreto mejor que la logística lineal) y
+  marginal en backtest por redundancia parcial con la fatiga y — para brazos recién
+  colocados — con `bullpen_xfip_30d`. El pago real es forward. No se promete mejora: se mide
+  contra el baseline v7 (run #93), con F5 como control que NO debe moverse (feature
+  Moneyline-only) dentro del ruido ±0.0002.
+
 ## Principios no negociables (del brief original)
 
 - No se promete rentabilidad. El producto vende claridad, control de riesgo y trazabilidad.

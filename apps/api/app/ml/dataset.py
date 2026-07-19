@@ -54,7 +54,12 @@ from app.features.offense import (
     woba,
     woba_parts,
 )
-from app.features.transactions import il_effect, il_out_asof, top_k_star_players
+from app.features.transactions import (
+    il_effect,
+    il_out_asof,
+    top_k_bullpen_arms,
+    top_k_star_players,
+)
 
 ROLLING_DAYS = 30
 RECENT_DAYS = 7
@@ -91,6 +96,7 @@ BP_FEATURE_NAMES = (
     "bullpen_b2b_flag",
     "bullpen_xfip_30d",
     "bullpen_ip_expected",
+    "bullpen_il_depletion",
 )
 
 _TEAM_FORM_NAMES = (
@@ -190,6 +196,7 @@ def load_pitching_frame(engine: Engine, sport: str = "mlb") -> pd.DataFrame:
 
 _BULLPEN_SQL = """
 SELECT l.team_id,
+       l.player_id,
        e.start_time_utc,
        l.outs_recorded,
        l.strikeouts,
@@ -595,7 +602,11 @@ def _utc_epoch_days(series: pd.Series) -> np.ndarray:
     )
 
 
-def _bullpen_features(bullpen: pd.DataFrame, games: pd.DataFrame) -> pd.DataFrame:
+def _bullpen_features(
+    bullpen: pd.DataFrame,
+    games: pd.DataFrame,
+    transactions: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """Per-game bullpen fatigue/quality (bulk twin of builder._bullpen_block).
 
     Windows are UTC calendar days ending YESTERDAY relative to each game's
@@ -605,6 +616,11 @@ def _bullpen_features(bullpen: pd.DataFrame, games: pd.DataFrame) -> pd.DataFram
     first archived reliever line stay NaN, or a partial archive would
     fabricate "fully rested" bullpens season-wide. The quality rate stays
     NaN without sample. Mirrors builder._bullpen_block exactly.
+
+    When ``transactions`` is provided it also computes ``bullpen_il_depletion``
+    (§1.4b, bulk twin of builder._bullpen_il_block): the count of the team's
+    top-K quality relievers (by the SAME xFIP-30d) on the IL as-of. Without it
+    the column stays NaN (the pre-006 degradation fallback).
     """
     bp = bullpen.sort_values("start_time_utc").reset_index(drop=True)
     days = _utc_epoch_days(bp["start_time_utc"])
@@ -649,11 +665,80 @@ def _bullpen_features(bullpen: pd.DataFrame, games: pd.DataFrame) -> pd.DataFram
             "fb": _cum(fb[pos]),
         }
 
+    # bullpen_il_depletion support (§1.4b): per (player, team) cumulative
+    # reliever arrays to rank the team's arms by xFIP-30d, plus the per-player
+    # IL move history. Built only when the transactions archive is available
+    # (moneyline path); without it bullpen_il_depletion stays NaN. Keyed by
+    # (player, team) so a traded reliever's lines with another club never enter
+    # this team's window — mirroring the online builder's team_id filter and the
+    # lineup per-player arrays.
+    rel_players: dict = {}
+    moves_by_player: dict = {}
+    min_txn_day: int | None = None
+    if transactions is not None and len(transactions):
+        bb_hbp = bb + hbp
+        for (pid, tid), group in bp.groupby(["player_id", "team_id"], sort=False):
+            pos = group.index.to_numpy()
+            rel_players.setdefault(tid, []).append(
+                (pid, {
+                    "days": days[pos],
+                    "outs": _cum(outs[pos]),
+                    "k": _cum(k[pos]),
+                    "bb_hbp": _cum(bb_hbp[pos]),
+                    "fb": _cum(fb[pos]),
+                })
+            )
+        for row in transactions.itertuples(index=False):
+            tday = _epoch_day(row.transaction_date)
+            # Archive-alive keys off ANY transaction date, updated BEFORE the
+            # il_effect filter — identical to _star_out_bulk and the online
+            # EXISTS(any row < event_day) gate (the parity bug fixed in 84b2edd).
+            if min_txn_day is None or tday < min_txn_day:
+                min_txn_day = tday
+            effect = il_effect(row.type_code, row.type_desc, row.description)
+            if effect is None:
+                continue
+            moves_by_player.setdefault(row.player_id, []).append(
+                (tday, row.mlb_transaction_id, effect)
+            )
+
+    def _bullpen_il_bulk(team_id, day, league) -> int | None:
+        # Twin of builder._bullpen_il_block: None when the reliever archive is
+        # not alive (league None), the transactions archive is not alive as-of
+        # (min move date not strictly before the game day), or no reliever clears
+        # the min-outs gate; else the count of top-K quality arms on the IL.
+        if league is None or min_txn_day is None or min_txn_day >= day:
+            return None
+        candidates = rel_players.get(team_id)
+        if not candidates:
+            return None
+        lg_hrfb, lg_core = league
+        player_xfips: dict = {}
+        for pid, entry in candidates:
+            d = entry["days"]
+            hi = int(np.searchsorted(d, day, side="left"))
+            lo = int(np.searchsorted(d, day - BULLPEN_QUALITY_DAYS, side="left"))
+            s_outs = entry["outs"][hi] - entry["outs"][lo]
+            if s_outs == 0:
+                continue
+            s_k = entry["k"][hi] - entry["k"][lo]
+            s_bb_hbp = entry["bb_hbp"][hi] - entry["bb_hbp"][lo]
+            s_fb = entry["fb"][hi] - entry["fb"][lo]
+            # MUST mirror builder._xfip_core (parity guard).
+            core = 13.0 * s_fb * lg_hrfb + 3.0 * s_bb_hbp - 2.0 * s_k
+            xfip = (core + SP_SHRINK_IP * lg_core) / (s_outs / 3.0 + SP_SHRINK_IP)
+            player_xfips[pid] = (xfip, float(s_outs))
+        arms = top_k_bullpen_arms(player_xfips)
+        if not arms:
+            return None
+        return sum(1 for pid in arms if il_out_asof(moves_by_player.get(pid, []), day))
+
     game_days = _utc_epoch_days(games["start_time_utc"])
     out = {
         f"{side}_{name}": np.full(len(games), np.nan)
         for side in ("home", "away")
-        for name in ("bullpen_ip_l3d", "bullpen_b2b_flag", "bullpen_xfip_30d")
+        for name in ("bullpen_ip_l3d", "bullpen_b2b_flag", "bullpen_xfip_30d",
+                     "bullpen_il_depletion")
     }
     team_cols = {
         "home": games["home_team_id"].to_numpy(dtype=object),
@@ -665,7 +750,13 @@ def _bullpen_features(bullpen: pd.DataFrame, games: pd.DataFrame) -> pd.DataFram
         if league is None:
             continue  # archive not alive yet at this date: NaN, not zeros
         for side in ("home", "away"):
-            t = teams.get(team_cols[side][i])
+            team_id = team_cols[side][i]
+            # bullpen_il_depletion is independent of the fatigue arrays — set it
+            # before the no-reliever early continue (mirrors _star_out_bulk).
+            il_val = _bullpen_il_bulk(team_id, day, league)
+            if il_val is not None:
+                out[f"{side}_bullpen_il_depletion"][i] = il_val
+            t = teams.get(team_id)
             if t is None:
                 out[f"{side}_bullpen_ip_l3d"][i] = 0.0
                 out[f"{side}_bullpen_b2b_flag"][i] = 0.0
@@ -1021,15 +1112,26 @@ def _merge_lineup_features(
 
 
 def _merge_bullpen_features(
-    frame: pd.DataFrame, bullpen: pd.DataFrame | None, games: pd.DataFrame
+    frame: pd.DataFrame,
+    bullpen: pd.DataFrame | None,
+    games: pd.DataFrame,
+    transactions: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Attach the day-window bullpen columns; NaN when no data was loaded."""
+    """Attach the day-window bullpen columns; NaN when no data was loaded.
+
+    ``bullpen_il_depletion`` (§1.4b) needs BOTH the reliever archive and the
+    transactions archive: with ``bullpen`` empty the whole block is NaN; with
+    ``transactions`` absent (pre-006 degradation) the fatigue/quality columns
+    still compute and only ``bullpen_il_depletion`` stays NaN."""
     if bullpen is None or len(bullpen) == 0:
         for side in ("home", "away"):
-            for name in ("bullpen_ip_l3d", "bullpen_b2b_flag", "bullpen_xfip_30d"):
+            for name in ("bullpen_ip_l3d", "bullpen_b2b_flag", "bullpen_xfip_30d",
+                         "bullpen_il_depletion"):
                 frame[f"{side}_{name}"] = np.nan
         return frame
-    return frame.merge(_bullpen_features(bullpen, games), on="event_id", how="left")
+    return frame.merge(
+        _bullpen_features(bullpen, games, transactions), on="event_id", how="left"
+    )
 
 
 def _merge_starter_features(
@@ -1107,7 +1209,7 @@ def build_training_frame(
     frame = _merge_offense_features(frame, batting, games, opp_hand)
     frame = _merge_lineup_features(frame, lineup, games, opp_hand, transactions)
     if market == "moneyline":
-        frame = _merge_bullpen_features(frame, bullpen, games)
+        frame = _merge_bullpen_features(frame, bullpen, games, transactions)
 
     if market == "moneyline":
         frame = frame[frame["home_score"] != frame["away_score"]].copy()
