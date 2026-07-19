@@ -162,8 +162,11 @@ cuenta 0/1/2 de los top-2 bateadores establecidos (≥200 PA, por wOBA as-of) de
 as-of `event_day−1` (replay del último movimiento IL con `date < event_day`; corte ≤ t-1
 porque la fecha viene sin hora). IL-based, no lineup-absence; ambos mercados; None/NaN
 (nunca 0) sin archivo vivo o sin star identificable. El clasificador IL reconoce "injured
-list" (2019+) y "disabled list" (pre-2019). `closer_available_flag` (§1.4) queda diferido a
-F1.4b (ver addendum).
+list" (2019+) y "disabled list" (pre-2019). `closer_available_flag` (§1.4) se implementó en
+la tanda **F1.4b** como `bullpen_il_depletion` — la variante honesta "depleción del bullpen
+por IL" (cuenta 0..K de los top-K brazos de calidad por xFIP-30d en IL as-of t-1, solo
+Moneyline), **NO** identidad de cerrador (no guardamos saves/entradas); ver addendum
+2026-07-19 en `docs/00`.
 
 ### 1.6 Bloque: park factors
 
