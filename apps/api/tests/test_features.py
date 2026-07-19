@@ -99,7 +99,13 @@ def test_starter_block_hand_computed_values(seeded):
     )
     assert away["bullpen_ip_expected"] == 5.0  # SP2: 15 outs in his one start
 
-    assert features["feature_version"] == "team_form_sp_bp_off_lineup_star_v6"
+    # bullpen_il_depletion (§1.4b): None here — the seed archives no player
+    # transactions, so the IL archive is not alive as-of and the count is
+    # unknown (never a fabricated 0), exactly like star_out_flag in this seed.
+    assert home["bullpen_il_depletion"] is None
+    assert away["bullpen_il_depletion"] is None
+
+    assert features["feature_version"] == "team_form_sp_bp_off_lineup_star_bpil_v7"
 
 
 def test_offense_block_hand_computed_values(seeded):
