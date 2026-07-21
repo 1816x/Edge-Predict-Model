@@ -326,3 +326,111 @@ def test_ambiguous_sibling_is_skipped_intact(db):
         )
         == 1
     )
+
+
+def test_manual_mode_repoints_certified_pair_without_id_transfer(db):
+    """The Orioles–Cubs shape: an early listing with a placeholder start ~5h
+    off spawned an orphan holding day-before lines; the corrected reissue
+    later merged onto the mlb event, which owns the LIVE odds id and its own
+    snapshots. Auto mode must skip (drift > window); manual mode repoints
+    with the human-certified pk and must NOT clobber the sibling's live id.
+    A re-run after success errors loudly with zero writes (the orphan is
+    gone — protects against a mistyped uuid ever touching a healthy row)."""
+    ORIOLES, CUBS = "Baltimore Orioles", "Chicago Cubs"
+    tables = store.reflect_tables(db)
+    with db.begin() as conn:
+        sport_id = store.get_sport_id(conn, tables)
+        # Sibling: the matinee, merged with the CORRECTED (live) odds id.
+        sib_id = _seed_mlb_event(
+            conn, tables, sport_id, 824816, ORIOLES, CUBS, _utc(9, 17, 35)
+        )
+        conn.execute(
+            text(
+                "UPDATE events SET external_ids = external_ids || "
+                "'{\"the_odds_api_id\": \"oid_live\"}' WHERE id = :id"
+            ),
+            {"id": sib_id},
+        )
+        store.insert_odds_snapshots(
+            conn, tables, sib_id, (_outcome("home"), _outcome("away")), _utc(9, 3, 55)
+        )
+        # Orphan: the placeholder listing (22:36, 5h01m off), lines captured
+        # the evening before.
+        orphan_id = _make_orphan(
+            conn, tables, sport_id, "oid_dead", ORIOLES, CUBS, _utc(9, 22, 36)
+        )
+        store.insert_odds_snapshots(
+            conn, tables, orphan_id, (_outcome("home"), _outcome("away")), _utc(8, 19, 42)
+        )
+
+    # Auto mode: drift > RESTAMP_WINDOW → no sibling → skipped intact.
+    auto = repair_orphan_events.run(engine=db)
+    assert [s["orphan_id"] for s in auto["skipped_no_sibling"]] == [str(orphan_id)]
+    assert auto["snapshots_repointed"] == 0
+
+    # Manual dry-run: reports the move, writes nothing.
+    dry = repair_orphan_events.run(
+        engine=db, dry_run=True, orphan_id=str(orphan_id), sibling_pk="824816"
+    )
+    assert dry["mode"] == "manual"
+    assert dry["snapshots_repointed"] == 2
+    assert dry["exact_dupes_deleted"] == 0
+    assert (
+        _scalar(db, "SELECT count(*) FROM odds_snapshots WHERE event_id = :id",
+                id=orphan_id)
+        == 2
+    )
+
+    # Manual real run.
+    real = repair_orphan_events.run(
+        engine=db, orphan_id=str(orphan_id), sibling_pk="824816"
+    )
+    assert real["snapshots_repointed"] == 2
+    assert real["events_deleted"] == 1
+    assert (
+        _scalar(db, "SELECT count(*) FROM odds_snapshots WHERE event_id = :id",
+                id=sib_id)
+        == 4
+    )
+    # The sibling's LIVE odds id is untouched; the dead one died with the orphan.
+    assert (
+        _scalar(db, "SELECT external_ids ->> 'the_odds_api_id' FROM events "
+                    "WHERE id = :id", id=sib_id)
+        == "oid_live"
+    )
+    assert _scalar(db, "SELECT count(*) FROM events WHERE id = :id", id=orphan_id) == 0
+    # Append-only guard re-armed.
+    with pytest.raises(DBAPIError, match="append-only"):
+        with db.begin() as conn:
+            conn.execute(
+                text("UPDATE odds_snapshots SET is_closing = true "
+                     "WHERE event_id = :id"),
+                {"id": sib_id},
+            )
+
+    # Re-run: loud error, zero writes.
+    with pytest.raises(ValueError, match="not an orphan"):
+        repair_orphan_events.run(
+            engine=db, orphan_id=str(orphan_id), sibling_pk="824816"
+        )
+    assert (
+        _scalar(db, "SELECT count(*) FROM odds_snapshots WHERE event_id = :id",
+                id=sib_id)
+        == 4
+    )
+
+
+def test_manual_mode_guards_reject_bad_input(db):
+    tables = store.reflect_tables(db)
+    with db.begin() as conn:
+        sport_id = store.get_sport_id(conn, tables)
+        sib_id = _seed_mlb_event(
+            conn, tables, sport_id, 824816, "Baltimore Orioles", "Chicago Cubs",
+            _utc(9, 17, 35),
+        )
+
+    with pytest.raises(ValueError, match="together"):
+        repair_orphan_events.run(engine=db, orphan_id=str(sib_id))
+    # A non-orphan target (has mlb_game_pk) is refused.
+    with pytest.raises(ValueError, match="not an orphan"):
+        repair_orphan_events.run(engine=db, orphan_id=str(sib_id), sibling_pk="824816")

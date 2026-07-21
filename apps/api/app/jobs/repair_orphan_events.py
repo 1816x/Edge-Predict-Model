@@ -37,6 +37,11 @@ Usage::
 
     python -m app.jobs.repair_orphan_events --dry-run
     python -m app.jobs.repair_orphan_events
+    # Manual mode — human-certified identity for a pair the window
+    # discriminator cannot resolve (e.g. commence drift > RESTAMP_WINDOW).
+    # Does NOT transfer the orphan's dead odds id onto the sibling.
+    python -m app.jobs.repair_orphan_events --dry-run --orphan-id <uuid> --sibling-pk <pk>
+    python -m app.jobs.repair_orphan_events --orphan-id <uuid> --sibling-pk <pk>
 """
 
 from __future__ import annotations
@@ -153,7 +158,14 @@ _DRY_DUPES_SQL = _DELETE_EXACT_DUPES_SQL.replace(
 )
 
 
-def _repair_pair(conn: Connection, orphan_id, sibling_id, odds_api_id, summary) -> None:
+def _repair_pair(
+    conn: Connection, orphan_id, sibling_id, odds_api_id, summary, *,
+    transfer_id: bool = True,
+) -> None:
+    """One orphan→sibling repair. ``transfer_id=False`` for the manual mode:
+    there the sibling already owns the game's LIVE odds id and the orphan's
+    is a dead, superseded listing — it must die with the orphan (in the
+    auto/churn mode it's the reverse: the orphan holds the current id)."""
     args = {"orphan_id": orphan_id, "sibling_id": sibling_id}
     demoted = conn.execute(text(_DEMOTE_CLOSING_SQL), args).rowcount
     promoted = conn.execute(text(_PROMOTE_CLOSING_SQL), args).rowcount
@@ -162,9 +174,10 @@ def _repair_pair(conn: Connection, orphan_id, sibling_id, odds_api_id, summary) 
     deleted = conn.execute(text(_DELETE_ORPHAN_SQL), {"orphan_id": orphan_id}).rowcount
     if deleted != 1:  # snapshots left behind would mean the repoint failed
         raise RuntimeError(f"orphan {orphan_id} not drained after repoint; aborting")
-    conn.execute(
-        text(_TRANSFER_ID_SQL), {"sibling_id": sibling_id, "odds_api_id": odds_api_id}
-    )
+    if transfer_id:
+        conn.execute(
+            text(_TRANSFER_ID_SQL), {"sibling_id": sibling_id, "odds_api_id": odds_api_id}
+        )
     summary["closing_flags_cleared"] += demoted
     summary["closing_flags_promoted"] += promoted
     summary["exact_dupes_deleted"] += deduped
@@ -175,11 +188,44 @@ def _repair_pair(conn: Connection, orphan_id, sibling_id, odds_api_id, summary) 
     )
 
 
-def run(*, dry_run: bool = False, engine: Engine | None = None) -> dict[str, Any]:
-    """Repair all uniquely-resolvable orphans; returns a summary dict."""
+# Manual mode: the human certifies the identity (evidence in PLAN.md /
+# docs), so the window discriminator is bypassed — but every write guard of
+# the auto path is reused verbatim. The orphan must still BE an orphan and
+# the sibling pk must resolve to exactly one event; anything else errors
+# out before any write.
+_MANUAL_ORPHAN_SQL = """
+SELECT id, external_ids ->> 'the_odds_api_id' AS odds_api_id
+FROM events
+WHERE id = CAST(:orphan_id AS uuid)
+  AND external_ids ? 'the_odds_api_id'
+  AND NOT (external_ids ? 'mlb_game_pk')
+"""
+
+_MANUAL_SIBLING_SQL = """
+SELECT id FROM events WHERE external_ids ->> 'mlb_game_pk' = :sibling_pk
+"""
+
+
+def run(
+    *,
+    dry_run: bool = False,
+    engine: Engine | None = None,
+    orphan_id: str | None = None,
+    sibling_pk: str | None = None,
+) -> dict[str, Any]:
+    """Repair orphans; returns a summary dict.
+
+    Default (auto) mode repairs every orphan with a unique window-matched
+    sibling. Manual mode (``orphan_id`` + ``sibling_pk``, both required
+    together) repairs exactly ONE human-certified pair, without transferring
+    the orphan's dead odds id onto the sibling.
+    """
+    if (orphan_id is None) != (sibling_pk is None):
+        raise ValueError("--orphan-id and --sibling-pk must be given together")
     engine = engine or make_engine(get_settings().database_url)
     summary: dict[str, Any] = {
         "job": "repair_orphan_events",
+        "mode": "manual" if orphan_id is not None else "auto",
         "dry_run": dry_run,
         "orphans_found": 0,
         "repointable": 0,
@@ -193,6 +239,57 @@ def run(*, dry_run: bool = False, engine: Engine | None = None) -> dict[str, Any
         "skipped_ambiguous": [],
     }
     window_s = RESTAMP_WINDOW.total_seconds()
+
+    if orphan_id is not None:
+        with engine.begin() as conn:
+            orow = conn.execute(
+                text(_MANUAL_ORPHAN_SQL), {"orphan_id": orphan_id}
+            ).first()
+            if orow is None:
+                raise ValueError(
+                    f"event {orphan_id} does not exist or is not an orphan "
+                    "(needs the_odds_api_id and no mlb_game_pk)"
+                )
+            srows = conn.execute(
+                text(_MANUAL_SIBLING_SQL), {"sibling_pk": str(sibling_pk)}
+            ).all()
+            if len(srows) != 1:
+                raise ValueError(
+                    f"sibling mlb_game_pk={sibling_pk} resolved to "
+                    f"{len(srows)} events; need exactly 1"
+                )
+            summary["orphans_found"] = 1
+            summary["repointable"] = 1
+            args = {"orphan_id": orow.id, "sibling_id": srows[0].id}
+            if dry_run:
+                summary["closing_flags_cleared"] = conn.execute(
+                    text(_DRY_CLOSING_SQL), args
+                ).scalar_one()
+                pair_dupes = conn.execute(text(_DRY_DUPES_SQL), args).scalar_one()
+                snaps = conn.execute(
+                    text(_COUNT_SNAPS_SQL), {"event_id": orow.id}
+                ).scalar_one()
+                summary["exact_dupes_deleted"] = pair_dupes
+                summary["snapshots_repointed"] = snaps - pair_dupes
+                summary["events_deleted"] = 1
+                return summary
+            conn.execute(
+                text(
+                    "ALTER TABLE odds_snapshots "
+                    "DISABLE TRIGGER trg_odds_snapshots_immutable"
+                )
+            )
+            _repair_pair(
+                conn, orow.id, srows[0].id, orow.odds_api_id, summary,
+                transfer_id=False,
+            )
+            conn.execute(
+                text(
+                    "ALTER TABLE odds_snapshots "
+                    "ENABLE TRIGGER trg_odds_snapshots_immutable"
+                )
+            )
+        return summary
 
     with engine.begin() as conn:
         pairs = conn.execute(text(_PAIRS_SQL), {"window_s": window_s}).all()
@@ -251,5 +348,21 @@ if __name__ == "__main__":
         "--dry-run", action="store_true",
         help="reporta qué cambiaría sin escribir nada",
     )
+    parser.add_argument(
+        "--orphan-id", default=None,
+        help="modo manual: uuid del evento huérfano certificado (requiere --sibling-pk)",
+    )
+    parser.add_argument(
+        "--sibling-pk", default=None,
+        help="modo manual: mlb_game_pk del evento destino certificado",
+    )
     args = parser.parse_args()
-    print(json.dumps(run(dry_run=args.dry_run)))
+    print(
+        json.dumps(
+            run(
+                dry_run=args.dry_run,
+                orphan_id=args.orphan_id,
+                sibling_pk=args.sibling_pk,
+            )
+        )
+    )
