@@ -86,6 +86,21 @@ EVENT_MATCH_WINDOW = timedelta(hours=3)
 # identity, so it demands near-certainty, while create/merge only adds one.
 RESTAMP_WINDOW = timedelta(minutes=5)
 
+# The Odds API spelling -> MLB-canonical name, ONLY for confirmed live drift
+# (never guessed: each entry is verified against both real feeds). Team-name
+# drift creates a duplicate teams row, which defeats the team-pair match and
+# orphans the event exactly like an id reissue does. Sole confirmed case as of
+# 2026-07: the All-Star Game (odds feed says "American League"/"National
+# League"; the MLB schedule says "... All-Stars" — produced the 2026-07-15
+# orphan in production). Regular-season names agree byte-for-byte in both
+# live feeds today; historical pairs in `teams` (Oakland Athletics/Athletics,
+# Cleveland Indians/Guardians) are the MLB feed's OWN renames across seasons,
+# not drift — both rows share one mlb_stats_id and must stay separate.
+_THE_ODDS_API_TEAM_ALIASES: dict[str, str] = {
+    "American League": "American League All-Stars",
+    "National League": "National League All-Stars",
+}
+
 logger = logging.getLogger(__name__)
 
 
@@ -124,27 +139,50 @@ def get_or_create_team(
     sport_id: uuid.UUID,
     name: str,
     mlb_stats_id: int | None = None,
+    *,
+    from_odds_feed: bool = False,
 ) -> uuid.UUID:
-    """Match teams by full name (both feeds use e.g. 'New York Yankees')."""
+    """Match teams by full name (both feeds use e.g. 'New York Yankees').
+
+    ``from_odds_feed=True`` additionally resolves the name through
+    ``_THE_ODDS_API_TEAM_ALIASES`` and through a previously stamped
+    ``external_ids.the_odds_api`` alias, so a feed spelling that drifts from
+    the MLB-canonical name still lands on the SAME team row instead of
+    spawning a duplicate (which would orphan the event downstream). When an
+    alias resolves, it is stamped on the row for future lookups.
+    """
     teams = t["teams"]
+    canonical = name
+    if from_odds_feed:
+        canonical = _THE_ODDS_API_TEAM_ALIASES.get(name, name)
+    where = teams.c.name == canonical
+    if from_odds_feed and canonical != name:
+        where = where | (teams.c.external_ids["the_odds_api"].astext == name)
     row = conn.execute(
-        select(teams.c.id, teams.c.external_ids).where(
-            teams.c.sport_id == sport_id, teams.c.name == name
-        )
+        select(teams.c.id, teams.c.external_ids).where(teams.c.sport_id == sport_id, where)
     ).first()
     if row is not None:
         existing = row.external_ids or {}
+        stamps: dict[str, object] = {}
         if mlb_stats_id is not None and "mlb_stats_id" not in existing:
+            stamps["mlb_stats_id"] = mlb_stats_id
+        if from_odds_feed and canonical != name and "the_odds_api" not in existing:
+            stamps["the_odds_api"] = name
+        if stamps:
             conn.execute(
                 update(teams)
                 .where(teams.c.id == row.id)
-                .values(external_ids={**existing, "mlb_stats_id": mlb_stats_id})
+                .values(external_ids={**existing, **stamps})
             )
         return row.id
-    external = {"mlb_stats_id": mlb_stats_id} if mlb_stats_id is not None else {}
+    external: dict[str, object] = {}
+    if mlb_stats_id is not None:
+        external["mlb_stats_id"] = mlb_stats_id
+    if from_odds_feed and canonical != name:
+        external["the_odds_api"] = name
     return conn.execute(
         teams.insert()
-        .values(sport_id=sport_id, name=name, external_ids=external)
+        .values(sport_id=sport_id, name=canonical, external_ids=external)
         .returning(teams.c.id)
     ).scalar_one()
 
@@ -305,8 +343,8 @@ def find_or_create_event_for_odds(
     if row is not None:
         return row.id, "matched"
 
-    home_id = get_or_create_team(conn, t, sport_id, ev.home_team)
-    away_id = get_or_create_team(conn, t, sport_id, ev.away_team)
+    home_id = get_or_create_team(conn, t, sport_id, ev.home_team, from_odds_feed=True)
+    away_id = get_or_create_team(conn, t, sport_id, ev.away_team, from_odds_feed=True)
 
     match = _find_event_by_teams(
         conn, t, sport_id, home_id, away_id, ev.commence_time, "the_odds_api_id"
