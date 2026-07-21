@@ -233,6 +233,60 @@ def test_closing_collision_demotes_orphan_flag_keeps_siblings(db):
     )
 
 
+def test_exact_dupe_with_lone_closing_flag_promotes_before_delete(db):
+    """A double-live listing wrote the same outcome at the same instant to
+    both rows, and only the ORPHAN's copy is flagged closing: the flag must
+    move to the kept sibling row, never be silently destroyed."""
+    tables = store.reflect_tables(db)
+    with db.begin() as conn:
+        sport_id = store.get_sport_id(conn, tables)
+        a_id = _seed_mlb_event(
+            conn, tables, sport_id, 824414, GUARDIANS, PIRATES, _utc(18, 17, 10)
+        )
+        conn.execute(
+            text(
+                "UPDATE events SET external_ids = external_ids || "
+                "'{\"the_odds_api_id\": \"oid_old\"}' WHERE id = :id"
+            ),
+            {"id": a_id},
+        )
+        b_id = _make_orphan(
+            conn, tables, sport_id, "oid_new", GUARDIANS, PIRATES, _utc(18, 17, 11)
+        )
+        # Same outcome, same capture instant, on BOTH rows — only the
+        # orphan's copy is the closing flag for this outcome.
+        store.insert_odds_snapshots(
+            conn, tables, a_id, (_outcome("home"),), _utc(18, 16, 40)
+        )
+        store.insert_odds_snapshots(
+            conn, tables, b_id, (_outcome("home"),), _utc(18, 16, 40),
+            is_closing=True,
+        )
+
+    summary = repair_orphan_events.run(engine=db)
+    assert summary["closing_flags_promoted"] == 1
+    assert summary["exact_dupes_deleted"] == 1
+    assert summary["snapshots_repointed"] == 0  # the only orphan row was a dupe
+    assert summary["events_deleted"] == 1
+    # Exactly one row survives for the outcome, and it carries the flag.
+    assert (
+        _scalar(
+            db,
+            "SELECT count(*) FROM odds_snapshots WHERE event_id = :id",
+            id=a_id,
+        )
+        == 1
+    )
+    assert (
+        _scalar(
+            db,
+            "SELECT count(*) FROM odds_snapshots WHERE event_id = :id AND is_closing",
+            id=a_id,
+        )
+        == 1
+    )
+
+
 def test_ambiguous_sibling_is_skipped_intact(db):
     """Identical-start doubleheader: two mlb siblings -> never guess."""
     tables = store.reflect_tables(db)

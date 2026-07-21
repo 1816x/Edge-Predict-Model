@@ -189,6 +189,55 @@ def test_split_doubleheader_reissue_never_touches_other_leg(db):
     assert leg("824412") == "oid_b"
 
 
+def test_reissue_with_unpriced_sibling_leg_restamps_not_merges(db):
+    """B2 (adversarial-review find): a reissue arriving while the OTHER
+    doubleheader leg is still id-less must re-stamp the priced leg, never
+    merge onto the unpriced one — that would append leg 1's lines to leg 2."""
+    _seed_schedule(
+        db,
+        [
+            (824414, GUARDIANS, PIRATES, _utc(18, 17, 10)),
+            (824415, GUARDIANS, PIRATES, _utc(18, 17, 40)),  # unpriced leg
+        ],
+    )
+    first = _cycle(
+        db,
+        [_feed_event("oid_a", GUARDIANS, PIRATES, "2026-07-18T17:10:00Z")],
+        _utc(18, 6),
+    )
+    assert first["events_matched"] == 1
+
+    # Reissue of leg 1's id, drifted to 17:11 — 29 min from the id-less leg
+    # 2, well inside the 3h merge window that would have swallowed it.
+    second = _cycle(
+        db,
+        [_feed_event("oid_a2", GUARDIANS, PIRATES, "2026-07-18T17:11:00Z")],
+        _utc(18, 12),
+    )
+    assert second["events_restamped"] == 1
+    assert second["events_created"] == 0
+
+    leg = lambda pk: _scalar(  # noqa: E731
+        db,
+        "SELECT external_ids ->> 'the_odds_api_id' FROM events "
+        "WHERE external_ids ->> 'mlb_game_pk' = :pk",
+        pk=pk,
+    )
+    assert leg("824414") == "oid_a2"
+    assert leg("824415") is None  # the unpriced leg stays untouched
+    # Every snapshot from both cycles lives under leg 1.
+    assert (
+        _scalar(
+            db,
+            """
+            SELECT count(*) FROM odds_snapshots s JOIN events e ON e.id = s.event_id
+            WHERE e.external_ids ->> 'mlb_game_pk' = '824414'
+            """,
+        )
+        == 4
+    )
+
+
 def test_identical_start_doubleheader_residual_and_ambiguous_refusal(db):
     """C. Identical-start DH: ids fill both legs (C1); a reissue with BOTH
     legs superseded is refused visibly as created_ambiguous (C2)."""

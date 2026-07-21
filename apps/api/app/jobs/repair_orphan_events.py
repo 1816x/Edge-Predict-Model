@@ -26,7 +26,10 @@ partial unique index allows only one, and the sibling's is the true closing
 line; the orphan's price row survives as non-closing evidence.
 
 Idempotent: a second run finds no repairable orphans and is a no-op. Safe to
-re-dispatch. ``--dry-run`` reports what would change without writing.
+re-dispatch. ``--dry-run`` reports what would change without writing; when two
+orphans map to ONE sibling its per-pair counts are evaluated against the
+current state (the real run repairs sequentially, so second-pair collision
+counts can differ slightly — the repair itself stays constraint-safe).
 
 Requires the ``DATABASE_URL`` role to own ``odds_snapshots`` (ALTER TABLE).
 
@@ -85,6 +88,24 @@ WHERE o.event_id = :orphan_id AND o.is_closing
   )
 """
 
+# Step 2b — before deleting an exact dupe that carries the ONLY closing flag
+# for its outcome, promote the sibling's identical-instant row so the flag is
+# never silently destroyed (adversarial-review find: double-live listings
+# straddling the closing window). Guarded so uq_odds_closing cannot collide.
+_PROMOTE_CLOSING_SQL = """
+UPDATE odds_snapshots s SET is_closing = true
+FROM odds_snapshots o
+WHERE o.event_id = :orphan_id AND o.is_closing
+  AND s.event_id = :sibling_id AND s.book_id = o.book_id
+  AND s.market = o.market AND s.side = o.side
+  AND s.captured_at = o.captured_at
+  AND NOT EXISTS (
+      SELECT 1 FROM odds_snapshots s2
+      WHERE s2.event_id = :sibling_id AND s2.is_closing
+        AND s2.book_id = o.book_id AND s2.market = o.market AND s2.side = o.side
+  )
+"""
+
 # Step 3 — defensive: an orphan row that exactly duplicates a sibling row on
 # the dedupe key (event, book, market, side, captured_at) would collide on
 # repoint. In practice zero rows (one cycle resolves a game to one event id).
@@ -133,15 +154,11 @@ _DRY_DUPES_SQL = _DELETE_EXACT_DUPES_SQL.replace(
 
 
 def _repair_pair(conn: Connection, orphan_id, sibling_id, odds_api_id, summary) -> None:
-    demoted = conn.execute(
-        text(_DEMOTE_CLOSING_SQL), {"orphan_id": orphan_id, "sibling_id": sibling_id}
-    ).rowcount
-    deduped = conn.execute(
-        text(_DELETE_EXACT_DUPES_SQL), {"orphan_id": orphan_id, "sibling_id": sibling_id}
-    ).rowcount
-    repointed = conn.execute(
-        text(_REPOINT_SQL), {"orphan_id": orphan_id, "sibling_id": sibling_id}
-    ).rowcount
+    args = {"orphan_id": orphan_id, "sibling_id": sibling_id}
+    demoted = conn.execute(text(_DEMOTE_CLOSING_SQL), args).rowcount
+    promoted = conn.execute(text(_PROMOTE_CLOSING_SQL), args).rowcount
+    deduped = conn.execute(text(_DELETE_EXACT_DUPES_SQL), args).rowcount
+    repointed = conn.execute(text(_REPOINT_SQL), args).rowcount
     deleted = conn.execute(text(_DELETE_ORPHAN_SQL), {"orphan_id": orphan_id}).rowcount
     if deleted != 1:  # snapshots left behind would mean the repoint failed
         raise RuntimeError(f"orphan {orphan_id} not drained after repoint; aborting")
@@ -149,6 +166,7 @@ def _repair_pair(conn: Connection, orphan_id, sibling_id, odds_api_id, summary) 
         text(_TRANSFER_ID_SQL), {"sibling_id": sibling_id, "odds_api_id": odds_api_id}
     )
     summary["closing_flags_cleared"] += demoted
+    summary["closing_flags_promoted"] += promoted
     summary["exact_dupes_deleted"] += deduped
     summary["snapshots_repointed"] += repointed
     summary["events_deleted"] += deleted
@@ -167,6 +185,7 @@ def run(*, dry_run: bool = False, engine: Engine | None = None) -> dict[str, Any
         "repointable": 0,
         "snapshots_repointed": 0,
         "closing_flags_cleared": 0,
+        "closing_flags_promoted": 0,
         "exact_dupes_deleted": 0,
         "events_deleted": 0,
         "repaired": [],

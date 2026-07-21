@@ -147,7 +147,11 @@ jobs:
             python -m app.jobs.backfill_results --start-date "$START" --end-date "$YDAY"
             python -m app.jobs.backfill_pitching --start-date "$START" --end-date "$YDAY"
             python -m app.jobs.sync_transactions --start-date "$START" --end-date "$YDAY"
-            python -m app.jobs.audit_snapshots --start-date "$YDAY" --end-date "$YDAY" --fail-on-gaps
+            # El audit usa el MISMO lookback de 3 días que los backfills: la
+            # detección (huecos, huérfanos de identidad) es one-shot sobre la
+            # ventana auditada, y un cron diario saltado por GitHub dejaría el
+            # día sin revisar para siempre con --start-date "$YDAY".
+            python -m app.jobs.audit_snapshots --start-date "$START" --end-date "$YDAY" --fail-on-gaps
           elif [ "$SCHEDULE" = "7,37 16-23,0-3 * * *" ]; then
             python -m app.jobs.snapshot_odds --closing-window-min 30
           else

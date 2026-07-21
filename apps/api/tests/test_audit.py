@@ -122,7 +122,12 @@ def test_audit_reports_days_and_gapped_events(db):
 
 
 class TestAuditIsRed:
-    """Pure red-policy tests (no DB): RED means action required."""
+    """Pure red-policy tests (no DB): RED means action required.
+
+    Total outages need no day-level rule here: an event with zero snapshots
+    and no capture run alive inside ITS window is classified capture_miss by
+    run() (the file-alive rule), so an outage day reds through that count.
+    """
 
     @staticmethod
     def _result(**over):
@@ -130,7 +135,6 @@ class TestAuditIsRed:
             "events_gapped_with_captures": 0,
             "events_capture_miss": 0,
             "orphan_events": [],
-            "days": [{"events": 15, "capture_runs": 5}],
             "events_unpriced": 0,
         }
         base.update(over)
@@ -160,26 +164,11 @@ class TestAuditIsRed:
         )
 
     def test_unpriced_alone_is_not_red(self):
-        # A game the market never offered doesn't fail an otherwise-covered
-        # day — nothing on our side needs action.
+        # A game the market never offered (liveness-proven by run()) doesn't
+        # fail the audit — nothing on our side needs action.
         from app.jobs.audit_snapshots import audit_is_red
 
         assert audit_is_red(self._result(events_unpriced=2)) is False
-
-    def test_total_outage_is_red_even_if_all_unpriced(self):
-        # Zero capture runs on a day with games: the classification must
-        # never silence a day where the cron simply didn't run.
-        from app.jobs.audit_snapshots import audit_is_red
-
-        assert (
-            audit_is_red(
-                self._result(
-                    events_unpriced=15,
-                    days=[{"events": 15, "capture_runs": 0}],
-                )
-            )
-            is True
-        )
 
 
 @pytest.mark.integration
@@ -233,7 +222,9 @@ def test_audit_classifies_unpriced_vs_capture_miss_and_orphans(db):
             conn, sport_id, 940002, dt(2026, 7, 8, 20, 0, tzinfo=timezone.utc)
         )
         _snap(conn, miss, dt(2026, 7, 8, 5, 0, tzinfo=timezone.utc))
-        # UNPRICED: started with zero snapshots EVER on a day that captured.
+        # UNPRICED: started with zero snapshots EVER, while the archive was
+        # demonstrably alive inside its window (the clean event's 15:23 run
+        # falls inside 940003's 07:00-17:00 window — the file-alive rule).
         _seed_event(conn, sport_id, 940003, dt(2026, 7, 8, 17, 0, tzinfo=timezone.utc))
         # ORPHAN: started odds-only event (identity fragmentation). It
         # carries captures — that is the point: the odds exist but are
@@ -310,32 +301,38 @@ def test_audit_green_when_only_unpriced_red_on_total_outage(db):
                     home_probable=None, away_probable=None,
                 ),
             )
-        # Only 950001 gets coverage; 950002 is never priced anywhere.
-        conn.execute(
-            text(
-                """
-                INSERT INTO odds_snapshots
-                    (event_id, book_id, market, side, price_decimal,
-                     price_american, captured_at)
-                SELECT e.id, b.id, 'moneyline', 'home', 1.91, -110, :captured_at
-                FROM events e, books b
-                WHERE e.external_ids ->> 'mlb_game_pk' = '950001'
-                  AND b.key = 'pinnacle'
-                """
-            ),
-            {"captured_at": _t(20, 23)},
-        )
+        # Only 950001 gets coverage (regular cadence, no intra-window gap);
+        # 950002 is never priced anywhere. The 15:23 run proves the archive
+        # was alive inside 950002's 07:00-17:00 window (later runs alone
+        # would not — liveness is per-event).
+        for captured_at in (_t(15, 23), _t(18, 23), _t(21, 23)):
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO odds_snapshots
+                        (event_id, book_id, market, side, price_decimal,
+                         price_american, captured_at)
+                    SELECT e.id, b.id, 'moneyline', 'home', 1.91, -110, :captured_at
+                    FROM events e, books b
+                    WHERE e.external_ids ->> 'mlb_game_pk' = '950001'
+                      AND b.key = 'pinnacle'
+                    """
+                ),
+                {"captured_at": captured_at},
+            )
 
     now = dt(2026, 7, 9, 12, 0, tzinfo=timezone.utc)
     result = audit_snapshots.run("2026-07-08", "2026-07-08", engine=db, now=now)
     assert result["events_unpriced"] == 1
     assert result["events_capture_miss"] == 0
-    # The day captured (capture_runs > 0): an unpriced game is not action.
+    # The archive was alive in its window: an unpriced game is not action.
     assert audit_is_red(result) is False
 
-    # Same day with the archive empty = total outage: always red.
+    # Same day with the archive empty = total outage: no liveness anywhere,
+    # so every zero-snapshot event is a capture miss — always red.
     with db.begin() as conn:
         conn.execute(text("TRUNCATE odds_snapshots CASCADE"))
     outage = audit_snapshots.run("2026-07-08", "2026-07-08", engine=db, now=now)
-    assert outage["events_unpriced"] == 2
+    assert outage["events_unpriced"] == 0
+    assert outage["events_capture_miss"] == 2
     assert audit_is_red(outage) is True

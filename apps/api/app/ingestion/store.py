@@ -4,22 +4,26 @@ Tables are reflected from the live database (see ``app.db.engine``); the
 schema's single source of truth is ``infra/schema.sql``. All writers take an
 open Connection so a job can commit one atomic transaction per run.
 
-Event identity strategy (doubleheader-safe):
+Event identity strategy (doubleheader-safe), in resolution order:
 1. Exact match by external id (``mlb_game_pk`` for the schedule job,
    ``the_odds_api_id`` for the odds job).
-2. Otherwise, same team pair with the closest start time within
+2. (odds job only, BEFORE the team+time merge) The Odds API sometimes
+   REISSUES an event's id mid-slate, with up to ~1 min of commence_time
+   drift. The old id vanishes from the feed, so tier 1 misses, and the
+   merge tier's "lacks the_odds_api_id" guard excludes the already-priced
+   row — without this tier the resolver would spawn a duplicate orphan
+   event and the game's odds history would fragment (production bug,
+   2026-07-18/19). If the same matchup within RESTAMP_WINDOW holds an odds
+   id that is NOT in the current feed cycle (superseded), the new id
+   re-stamps that event instead. An id still live in the feed is never
+   overwritten, so doubleheader legs stay separate. Runs before the merge
+   tier because a ≤5-min superseded-id match is strictly stronger evidence
+   than an id-less row up to 3 h away (else a reissue could merge onto the
+   wrong, still-unpriced doubleheader leg).
+3. Otherwise, same team pair with the closest start time within
    EVENT_MATCH_WINDOW — close enough to absorb feed clock drift, small
    enough that a doubleheader's two games (hours apart) never cross-match.
-2.5. (odds job only) The Odds API sometimes REISSUES an event's id mid-slate,
-   with up to ~1 min of commence_time drift. The old id vanishes from the
-   feed, so tier 1 misses, and tier 2's "lacks the_odds_api_id" guard
-   excludes the already-priced row — without this tier the resolver would
-   spawn a duplicate orphan event and the game's odds history would
-   fragment (production bug, 2026-07-18/19). If the same matchup within
-   RESTAMP_WINDOW holds an odds id that is NOT in the current feed cycle
-   (superseded), the new id re-stamps that event instead. An id still live
-   in the feed is never overwritten, so doubleheader legs stay separate.
-3. Otherwise, a new event row is created and external ids merge later.
+4. Otherwise, a new event row is created and external ids merge later.
 """
 
 from __future__ import annotations
@@ -346,19 +350,13 @@ def find_or_create_event_for_odds(
     home_id = get_or_create_team(conn, t, sport_id, ev.home_team, from_odds_feed=True)
     away_id = get_or_create_team(conn, t, sport_id, ev.away_team, from_odds_feed=True)
 
-    match = _find_event_by_teams(
-        conn, t, sport_id, home_id, away_id, ev.commence_time, "the_odds_api_id"
-    )
-    if match is not None:
-        conn.execute(
-            update(events)
-            .where(events.c.id == match.id)
-            .values(
-                external_ids={**(match.external_ids or {}), "the_odds_api_id": ev.source_id}
-            )
-        )
-        return match.id, "merged"
-
+    # Tier 2.5 runs BEFORE tier 2: a same-pair event ≤ RESTAMP_WINDOW away
+    # whose stored id just vanished from the feed is near-certain evidence of
+    # an id reissue — strictly stronger than an id-less row up to 3 h away.
+    # With tier 2 first, a reissue on a doubleheader day whose OTHER leg is
+    # still unpriced would merge the reissued id onto that id-less leg,
+    # silently appending leg 1's lines to leg 2 (adversarial-review find,
+    # 2026-07-20) — worse than the fragmentation this tier exists to stop.
     created_action = "created"
     if live_odds_ids is not None:
         stale = _find_restampable_events(
@@ -383,10 +381,10 @@ def find_or_create_event_for_odds(
         if len(stale) > 1:
             # Identical-start doubleheader with BOTH legs superseded: any
             # choice could clobber the wrong leg's identity, so refuse and
-            # create visibly instead of guessing.
+            # fall through visibly instead of guessing.
             logger.warning(
                 "restamp ambiguous: odds id %s (%s @ %s, %s) matches %d "
-                "superseded events %s; creating a new event instead",
+                "superseded events %s; refusing to restamp",
                 ev.source_id,
                 ev.away_team,
                 ev.home_team,
@@ -395,6 +393,19 @@ def find_or_create_event_for_odds(
                 [str(r.id) for r in stale],
             )
             created_action = "created_ambiguous"
+
+    match = _find_event_by_teams(
+        conn, t, sport_id, home_id, away_id, ev.commence_time, "the_odds_api_id"
+    )
+    if match is not None:
+        conn.execute(
+            update(events)
+            .where(events.c.id == match.id)
+            .values(
+                external_ids={**(match.external_ids or {}), "the_odds_api_id": ev.source_id}
+            )
+        )
+        return match.id, "merged"
 
     new_id = conn.execute(
         events.insert()

@@ -17,17 +17,22 @@ Definitions (aligned with the 4-snapshots/day free-tier cadence):
 
 RED (exit 2 under ``--fail-on-gaps``) means "action required", so zero-
 snapshot events are CLASSIFIED before failing (``audit_is_red``):
-- capture_miss — the event has snapshots in history but none inside the
-  window: something on our side stopped capturing a priced game. RED.
-- unpriced — zero snapshots EVER: as far as our archive can tell the market
-  never offered the game (some doubleheader game 2s never get a line). Not
-  red by itself — unless the day had NO capture runs at all (a total outage
-  must never be silenced by this classification). Reported distinctly so
-  the day's coverage stays honest.
+- capture_miss — RED. Either the event has snapshots in history but none
+  inside the window (we stopped capturing a priced game), or NO capture run
+  fired anywhere during its pregame window (we never looked, so "the market
+  didn't price it" cannot be claimed — the file-alive rule: a zero is only
+  true when the archive was demonstrably alive).
+- unpriced — zero snapshots ever AND at least one capture run landed inside
+  the event's window: the archive was alive and the feed did not carry the
+  game (some doubleheader game 2s never get a line). Not red — nothing on
+  our side needs action. Reported distinctly so coverage stays honest.
 - orphan_events — started events carrying only ``the_odds_api_id`` (no
   ``mlb_game_pk``): odds-identity fragmentation (id reissue / team-name
   drift). Their snapshots are invisible to every mlb_game_pk join, so this
-  is RED — the audit is the regression detector for that bug class.
+  is RED — the audit is the regression detector for that bug class. NOTE:
+  detection is windowed to the audited range, so the daily cron runs the
+  audit with the same 3-day lookback as the backfills (a skipped cron day
+  still gets checked twice more).
 
 Usage::
 
@@ -79,12 +84,30 @@ ORDER BY 1
 """
 
 _RUNS_SQL = """
-SELECT (captured_at AT TIME ZONE 'UTC')::date AS day,
-       count(DISTINCT date_trunc('minute', captured_at)) AS capture_runs,
+SELECT (os.captured_at AT TIME ZONE 'UTC')::date AS day,
+       count(DISTINCT date_trunc('minute', os.captured_at)) AS capture_runs,
        count(*) AS snapshot_rows
-FROM odds_snapshots
-WHERE (captured_at AT TIME ZONE 'UTC')::date BETWEEN :start AND :end
+FROM odds_snapshots os
+JOIN events e ON e.id = os.event_id
+JOIN sports s ON s.id = e.sport_id
+WHERE s.key = :sport
+  AND (os.captured_at AT TIME ZONE 'UTC')::date BETWEEN :start AND :end
 GROUP BY 1
+ORDER BY 1
+"""
+
+# Liveness ledger for the file-alive rule: every distinct capture instant
+# (minute-truncated cron firing) near the audited range. An event's pregame
+# window can start on the previous UTC day (window is 10h), hence the 1-day
+# pad on the lower bound.
+_INSTANTS_SQL = """
+SELECT DISTINCT date_trunc('minute', os.captured_at) AS instant
+FROM odds_snapshots os
+JOIN events e ON e.id = os.event_id
+JOIN sports s ON s.id = e.sport_id
+WHERE s.key = :sport
+  AND os.captured_at >= CAST(:start AS date) - INTERVAL '1 day'
+  AND os.captured_at < CAST(:end AS date) + INTERVAL '2 day'
 ORDER BY 1
 """
 
@@ -168,20 +191,19 @@ def find_gaps(
 def audit_is_red(result: dict[str, Any]) -> bool:
     """RED = action required (pure, unit-testable; see module docstring).
 
-    - a priced event with an intra-window gap or a full capture miss, or
-    - identity fragmentation (orphan odds-only events), or
-    - a day with games but ZERO capture runs (total outage — never silenced
-      by the unpriced classification).
-    An event the market never priced (``events_unpriced``) is reported but
-    does not, by itself, fail an otherwise-covered day.
+    - a priced event with an intra-window gap, or
+    - a capture miss (priced-but-unwindowed, or zero snapshots with no
+      capture run alive in the event's window — a total outage lands here
+      because every affected event fails the liveness test), or
+    - identity fragmentation (orphan odds-only events).
+    An event the market never priced (``events_unpriced``, liveness-proven)
+    is reported but never fails the run by itself.
     """
     if result["events_gapped_with_captures"] > 0:
         return True
     if result["events_capture_miss"] > 0:
         return True
-    if result["orphan_events"]:
-        return True
-    return any(d["events"] > 0 and d["capture_runs"] == 0 for d in result["days"])
+    return bool(result["orphan_events"])
 
 
 def run(
@@ -217,6 +239,9 @@ def run(
             r["event_id"]
             for r in conn.execute(text(_EVER_PRICED_SQL), {**params, "now": now}).mappings()
         }
+        instants = [
+            r["instant"] for r in conn.execute(text(_INSTANTS_SQL), params).mappings()
+        ]
         orphan_rows = conn.execute(
             text(_ORPHANS_SQL), {**params, "now": now}
         ).mappings().all()
@@ -241,7 +266,13 @@ def run(
             gapped_with_captures += 1
         else:
             zero_snapshots += 1
-            if event_id in ever_priced:
+            window_start = entry["start"] - PREGAME_WINDOW
+            file_alive = any(
+                window_start <= i <= entry["start"] for i in instants
+            )
+            if event_id in ever_priced or not file_alive:
+                # Priced-but-unwindowed, OR nobody ever looked during its
+                # window — either way "unpriced" cannot be claimed.
                 kind = "capture_miss"
                 capture_miss += 1
             else:
@@ -330,6 +361,11 @@ def _markdown_summary(result: dict[str, Any]) -> str:
             lines.append(
                 f"- {ev['away']} @ {ev['home']} (inicio {ev['start_time_utc']}, "
                 f"odds id {ev['the_odds_api_id']})"
+            )
+        if result["events_unpriced"]:
+            lines.append(
+                "Ojo: con huérfanos presentes, la etiqueta 'sin línea' no es "
+                "confiable — las líneas del gemelo pueden vivir en el huérfano."
             )
     if not audit_is_red(result):
         lines.append("")
