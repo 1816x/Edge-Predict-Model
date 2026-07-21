@@ -116,7 +116,8 @@ WHERE id = :orphan_id
 # uq_events_odds_api_id cannot collide.
 _TRANSFER_ID_SQL = """
 UPDATE events
-SET external_ids = external_ids || jsonb_build_object('the_odds_api_id', :odds_api_id)
+SET external_ids = external_ids
+    || jsonb_build_object('the_odds_api_id', CAST(:odds_api_id AS text))
 WHERE id = :sibling_id
 """
 
