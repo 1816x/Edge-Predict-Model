@@ -15,6 +15,20 @@ Definitions (aligned with the 4-snapshots/day free-tier cadence):
 - Only events that already started are audited; a future game's window is
   incomplete by definition.
 
+RED (exit 2 under ``--fail-on-gaps``) means "action required", so zero-
+snapshot events are CLASSIFIED before failing (``audit_is_red``):
+- capture_miss — the event has snapshots in history but none inside the
+  window: something on our side stopped capturing a priced game. RED.
+- unpriced — zero snapshots EVER: as far as our archive can tell the market
+  never offered the game (some doubleheader game 2s never get a line). Not
+  red by itself — unless the day had NO capture runs at all (a total outage
+  must never be silenced by this classification). Reported distinctly so
+  the day's coverage stays honest.
+- orphan_events — started events carrying only ``the_odds_api_id`` (no
+  ``mlb_game_pk``): odds-identity fragmentation (id reissue / team-name
+  drift). Their snapshots are invisible to every mlb_game_pk join, so this
+  is RED — the audit is the regression detector for that bug class.
+
 Usage::
 
     python -m app.jobs.audit_snapshots                    # last 14 days
@@ -40,13 +54,19 @@ DEFAULT_MAX_GAP_HOURS = 4.0
 DEFAULT_DAYS_BACK = 14
 _EVENT_LIST_CAP = 50
 
+# events_with_pregame uses the SAME 10h window as the per-event gap logic:
+# with an unbounded lower edge the summary contradicts itself (an event whose
+# only snapshot landed 15h early counted as "with pregame" while the gap
+# audit flagged it as zero-snapshot — the 2026-07-19/20 red runs).
 _DAYS_SQL = """
 SELECT (e.start_time_utc AT TIME ZONE 'UTC')::date AS day,
        count(*) AS events,
        count(*) FILTER (
            WHERE EXISTS (
                SELECT 1 FROM odds_snapshots os
-               WHERE os.event_id = e.id AND os.captured_at <= e.start_time_utc
+               WHERE os.event_id = e.id
+                 AND os.captured_at <= e.start_time_utc
+                 AND os.captured_at >= e.start_time_utc - :window
            )
        ) AS events_with_pregame
 FROM events e
@@ -86,6 +106,44 @@ WHERE s.key = :sport
 ORDER BY e.start_time_utc, os.captured_at
 """
 
+# Unpriced-vs-miss discriminator: audited events with at least one snapshot
+# ANYWHERE in history (no window). Zero-in-window + present here = a real
+# capture miss; zero-in-window + absent here = the market never priced it.
+_EVER_PRICED_SQL = """
+SELECT DISTINCT e.id AS event_id
+FROM events e
+JOIN sports s ON s.id = e.sport_id
+JOIN odds_snapshots os ON os.event_id = e.id
+WHERE s.key = :sport
+  AND e.status NOT IN ('postponed', 'cancelled')
+  AND (e.start_time_utc AT TIME ZONE 'UTC')::date BETWEEN :start AND :end
+  AND e.start_time_utc <= :now
+"""
+
+# Identity-fragmentation detector: a STARTED event still carrying only the
+# odds id means the odds feed's game never reconciled with the MLB schedule
+# (id reissue or team-name drift) — its snapshots are invisible to every
+# mlb_game_pk join. sync_schedule runs before every snapshot, so in a healthy
+# pipeline this set is empty.
+_ORPHANS_SQL = """
+SELECT e.id AS event_id,
+       e.external_ids ->> 'the_odds_api_id' AS odds_api_id,
+       e.start_time_utc,
+       ht.name AS home,
+       at.name AS away
+FROM events e
+JOIN sports s ON s.id = e.sport_id
+JOIN teams ht ON ht.id = e.home_team_id
+JOIN teams at ON at.id = e.away_team_id
+WHERE s.key = :sport
+  AND e.external_ids ? 'the_odds_api_id'
+  AND NOT (e.external_ids ? 'mlb_game_pk')
+  AND e.status NOT IN ('postponed', 'cancelled')
+  AND (e.start_time_utc AT TIME ZONE 'UTC')::date BETWEEN :start AND :end
+  AND e.start_time_utc <= :now
+ORDER BY e.start_time_utc
+"""
+
 
 def find_gaps(
     start_time: datetime,
@@ -105,6 +163,25 @@ def find_gaps(
         return [(window_start, start_time)]
     points = [*caps, start_time]
     return [(a, b) for a, b in zip(points, points[1:]) if b - a > max_gap]
+
+
+def audit_is_red(result: dict[str, Any]) -> bool:
+    """RED = action required (pure, unit-testable; see module docstring).
+
+    - a priced event with an intra-window gap or a full capture miss, or
+    - identity fragmentation (orphan odds-only events), or
+    - a day with games but ZERO capture runs (total outage — never silenced
+      by the unpriced classification).
+    An event the market never priced (``events_unpriced``) is reported but
+    does not, by itself, fail an otherwise-covered day.
+    """
+    if result["events_gapped_with_captures"] > 0:
+        return True
+    if result["events_capture_miss"] > 0:
+        return True
+    if result["orphan_events"]:
+        return True
+    return any(d["events"] > 0 and d["capture_runs"] == 0 for d in result["days"])
 
 
 def run(
@@ -129,10 +206,19 @@ def run(
 
     params = {"sport": "mlb", "start": start, "end": end}
     with engine.connect() as conn:
-        day_rows = conn.execute(text(_DAYS_SQL), params).mappings().all()
+        day_rows = conn.execute(
+            text(_DAYS_SQL), {**params, "window": PREGAME_WINDOW}
+        ).mappings().all()
         run_rows = {r["day"]: r for r in conn.execute(text(_RUNS_SQL), params).mappings()}
         capture_rows = conn.execute(
             text(_CAPTURES_SQL), {**params, "window": PREGAME_WINDOW, "now": now}
+        ).mappings().all()
+        ever_priced = {
+            r["event_id"]
+            for r in conn.execute(text(_EVER_PRICED_SQL), {**params, "now": now}).mappings()
+        }
+        orphan_rows = conn.execute(
+            text(_ORPHANS_SQL), {**params, "now": now}
         ).mappings().all()
 
     events: dict[Any, dict[str, Any]] = {}
@@ -145,25 +231,33 @@ def run(
             entry["captures"].append(row["captured_at"])
 
     gapped: list[dict[str, Any]] = []
-    zero_snapshots = 0
-    for entry in events.values():
+    zero_snapshots = capture_miss = unpriced = gapped_with_captures = 0
+    for event_id, entry in events.items():
         gaps = find_gaps(entry["start"], entry["captures"], max_gap)
         if not gaps:
             continue
-        if not entry["captures"]:
+        if entry["captures"]:
+            kind = "gap"
+            gapped_with_captures += 1
+        else:
             zero_snapshots += 1
+            if event_id in ever_priced:
+                kind = "capture_miss"
+                capture_miss += 1
+            else:
+                kind = "unpriced"
+                unpriced += 1
         if len(gapped) < _EVENT_LIST_CAP:
             gapped.append(
                 {
                     "mlb_game_pk": entry["pk"],
                     "start_time_utc": entry["start"].isoformat(),
                     "captures": len(set(entry["captures"])),
+                    "kind": kind,
                     "gaps": [[a.isoformat(), b.isoformat()] for a, b in gaps],
                 }
             )
-    events_with_gaps = sum(
-        1 for e in events.values() if find_gaps(e["start"], e["captures"], max_gap)
-    )
+    events_with_gaps = gapped_with_captures + zero_snapshots
 
     return {
         "job": "audit_snapshots",
@@ -183,8 +277,20 @@ def run(
         "events_audited": len(events),
         "events_clean": len(events) - events_with_gaps,
         "events_with_gaps": events_with_gaps,
+        "events_gapped_with_captures": gapped_with_captures,
         "events_zero_snapshots": zero_snapshots,
+        "events_capture_miss": capture_miss,
+        "events_unpriced": unpriced,
         "gapped_events": gapped,
+        "orphan_events": [
+            {
+                "the_odds_api_id": r["odds_api_id"],
+                "start_time_utc": r["start_time_utc"].isoformat(),
+                "home": r["home"],
+                "away": r["away"],
+            }
+            for r in orphan_rows
+        ],
     }
 
 
@@ -195,8 +301,10 @@ def _markdown_summary(result: dict[str, Any]) -> str:
         "",
         f"Eventos auditados: {result['events_audited']} · limpios: "
         f"{result['events_clean']} · con huecos (> {result['max_gap_hours']} h): "
-        f"{result['events_with_gaps']} · sin ningún snapshot: "
-        f"{result['events_zero_snapshots']}",
+        f"{result['events_with_gaps']} · capturas perdidas: "
+        f"{result['events_capture_miss']} · sin línea en el mercado: "
+        f"{result['events_unpriced']} · huérfanos de identidad: "
+        f"{len(result['orphan_events'])}",
         "",
         "| Día | Eventos | Con odds pregame | Corridas de captura | Filas |",
         "|---|---|---|---|---|",
@@ -211,10 +319,21 @@ def _markdown_summary(result: dict[str, Any]) -> str:
         lines.append("Huecos (primeros ejemplos):")
         for ev in result["gapped_events"][:10]:
             gaps = "; ".join(f"{a} → {b}" for a, b in ev["gaps"])
-            lines.append(f"- pk {ev['mlb_game_pk']} (inicio {ev['start_time_utc']}): {gaps}")
-    else:
+            lines.append(
+                f"- pk {ev['mlb_game_pk']} [{ev['kind']}] "
+                f"(inicio {ev['start_time_utc']}): {gaps}"
+            )
+    if result["orphan_events"]:
         lines.append("")
-        lines.append("Sin huecos en la ventana auditada. ✔")
+        lines.append("Huérfanos de identidad (odds sin mlb_game_pk — fragmentación):")
+        for ev in result["orphan_events"][:10]:
+            lines.append(
+                f"- {ev['away']} @ {ev['home']} (inicio {ev['start_time_utc']}, "
+                f"odds id {ev['the_odds_api_id']})"
+            )
+    if not audit_is_red(result):
+        lines.append("")
+        lines.append("Sin acción requerida en la ventana auditada. ✔")
     return "\n".join(lines)
 
 
@@ -225,7 +344,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-gap-hours", type=float, default=DEFAULT_MAX_GAP_HOURS)
     parser.add_argument(
         "--fail-on-gaps", action="store_true",
-        help="exit 2 si hay huecos: pone en rojo la corrida del cron que audita",
+        help="exit 2 si hay acción requerida (audit_is_red): capturas "
+        "perdidas, huecos intra-ventana, huérfanos o apagón total del día",
     )
     args = parser.parse_args()
     result = run(
@@ -233,5 +353,5 @@ if __name__ == "__main__":
     )
     print(json.dumps(result))
     print(_markdown_summary(result))
-    if args.fail_on_gaps and result["events_with_gaps"] > 0:
+    if args.fail_on_gaps and audit_is_red(result):
         sys.exit(2)
