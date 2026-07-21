@@ -4,17 +4,31 @@ Tables are reflected from the live database (see ``app.db.engine``); the
 schema's single source of truth is ``infra/schema.sql``. All writers take an
 open Connection so a job can commit one atomic transaction per run.
 
-Event identity strategy (doubleheader-safe):
+Event identity strategy (doubleheader-safe), in resolution order:
 1. Exact match by external id (``mlb_game_pk`` for the schedule job,
    ``the_odds_api_id`` for the odds job).
-2. Otherwise, same team pair with the closest start time within
+2. (odds job only, BEFORE the team+time merge) The Odds API sometimes
+   REISSUES an event's id mid-slate, with up to ~1 min of commence_time
+   drift. The old id vanishes from the feed, so tier 1 misses, and the
+   merge tier's "lacks the_odds_api_id" guard excludes the already-priced
+   row — without this tier the resolver would spawn a duplicate orphan
+   event and the game's odds history would fragment (production bug,
+   2026-07-18/19). If the same matchup within RESTAMP_WINDOW holds an odds
+   id that is NOT in the current feed cycle (superseded), the new id
+   re-stamps that event instead. An id still live in the feed is never
+   overwritten, so doubleheader legs stay separate. Runs before the merge
+   tier because a ≤5-min superseded-id match is strictly stronger evidence
+   than an id-less row up to 3 h away (else a reissue could merge onto the
+   wrong, still-unpriced doubleheader leg).
+3. Otherwise, same team pair with the closest start time within
    EVENT_MATCH_WINDOW — close enough to absorb feed clock drift, small
    enough that a doubleheader's two games (hours apart) never cross-match.
-3. Otherwise, a new event row is created and external ids merge later.
+4. Otherwise, a new event row is created and external ids merge later.
 """
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timedelta
 
@@ -70,6 +84,29 @@ TRANSACTIONS_TABLE = "player_transactions"
 
 EVENT_MATCH_WINDOW = timedelta(hours=3)
 
+# Tier 2.5 (id reissue) window. Observed reissue drift is ±1 min; the legs of
+# a split doubleheader are hours apart, so 5 minutes cannot cross-match them.
+# Deliberately much tighter than EVENT_MATCH_WINDOW: re-stamping overwrites an
+# identity, so it demands near-certainty, while create/merge only adds one.
+RESTAMP_WINDOW = timedelta(minutes=5)
+
+# The Odds API spelling -> MLB-canonical name, ONLY for confirmed live drift
+# (never guessed: each entry is verified against both real feeds). Team-name
+# drift creates a duplicate teams row, which defeats the team-pair match and
+# orphans the event exactly like an id reissue does. Sole confirmed case as of
+# 2026-07: the All-Star Game (odds feed says "American League"/"National
+# League"; the MLB schedule says "... All-Stars" — produced the 2026-07-15
+# orphan in production). Regular-season names agree byte-for-byte in both
+# live feeds today; historical pairs in `teams` (Oakland Athletics/Athletics,
+# Cleveland Indians/Guardians) are the MLB feed's OWN renames across seasons,
+# not drift — both rows share one mlb_stats_id and must stay separate.
+_THE_ODDS_API_TEAM_ALIASES: dict[str, str] = {
+    "American League": "American League All-Stars",
+    "National League": "National League All-Stars",
+}
+
+logger = logging.getLogger(__name__)
+
 
 def reflect_tables(
     engine: Engine, names: tuple[str, ...] = INGESTION_TABLES
@@ -106,27 +143,50 @@ def get_or_create_team(
     sport_id: uuid.UUID,
     name: str,
     mlb_stats_id: int | None = None,
+    *,
+    from_odds_feed: bool = False,
 ) -> uuid.UUID:
-    """Match teams by full name (both feeds use e.g. 'New York Yankees')."""
+    """Match teams by full name (both feeds use e.g. 'New York Yankees').
+
+    ``from_odds_feed=True`` additionally resolves the name through
+    ``_THE_ODDS_API_TEAM_ALIASES`` and through a previously stamped
+    ``external_ids.the_odds_api`` alias, so a feed spelling that drifts from
+    the MLB-canonical name still lands on the SAME team row instead of
+    spawning a duplicate (which would orphan the event downstream). When an
+    alias resolves, it is stamped on the row for future lookups.
+    """
     teams = t["teams"]
+    canonical = name
+    if from_odds_feed:
+        canonical = _THE_ODDS_API_TEAM_ALIASES.get(name, name)
+    where = teams.c.name == canonical
+    if from_odds_feed and canonical != name:
+        where = where | (teams.c.external_ids["the_odds_api"].astext == name)
     row = conn.execute(
-        select(teams.c.id, teams.c.external_ids).where(
-            teams.c.sport_id == sport_id, teams.c.name == name
-        )
+        select(teams.c.id, teams.c.external_ids).where(teams.c.sport_id == sport_id, where)
     ).first()
     if row is not None:
         existing = row.external_ids or {}
+        stamps: dict[str, object] = {}
         if mlb_stats_id is not None and "mlb_stats_id" not in existing:
+            stamps["mlb_stats_id"] = mlb_stats_id
+        if from_odds_feed and canonical != name and "the_odds_api" not in existing:
+            stamps["the_odds_api"] = name
+        if stamps:
             conn.execute(
                 update(teams)
                 .where(teams.c.id == row.id)
-                .values(external_ids={**existing, "mlb_stats_id": mlb_stats_id})
+                .values(external_ids={**existing, **stamps})
             )
         return row.id
-    external = {"mlb_stats_id": mlb_stats_id} if mlb_stats_id is not None else {}
+    external: dict[str, object] = {}
+    if mlb_stats_id is not None:
+        external["mlb_stats_id"] = mlb_stats_id
+    if from_odds_feed and canonical != name:
+        external["the_odds_api"] = name
     return conn.execute(
         teams.insert()
-        .values(sport_id=sport_id, name=name, external_ids=external)
+        .values(sport_id=sport_id, name=canonical, external_ids=external)
         .returning(teams.c.id)
     ).scalar_one()
 
@@ -217,10 +277,67 @@ def upsert_event_from_schedule(
     return new_id, True
 
 
+def _find_restampable_events(
+    conn: Connection,
+    t: dict[str, Table],
+    sport_id: uuid.UUID,
+    home_team_id: uuid.UUID,
+    away_team_id: uuid.UUID,
+    start_time: datetime,
+    live_odds_ids: frozenset[str],
+    window: timedelta = RESTAMP_WINDOW,
+) -> list[Row]:
+    """Events whose odds id was superseded by the current feed cycle.
+
+    Candidates: same team pair, |start - commence| <= ``window``, already
+    carrying ``the_odds_api_id`` (the opposite of tier 2's guard) — but ONLY
+    those whose stored id is absent from ``live_odds_ids``. An id still
+    present in this cycle's payload identifies a live, distinct game (e.g.
+    the other leg of a doubleheader) and must never be overwritten.
+    """
+    events = t["events"]
+    seconds_off = func.abs(func.extract("epoch", events.c.start_time_utc - start_time))
+    rows = conn.execute(
+        select(events.c.id, events.c.external_ids)
+        .where(
+            events.c.sport_id == sport_id,
+            events.c.home_team_id == home_team_id,
+            events.c.away_team_id == away_team_id,
+            events.c.external_ids.has_key("the_odds_api_id"),
+            seconds_off <= window.total_seconds(),
+        )
+        .order_by(seconds_off)
+    ).all()
+    return [
+        r
+        for r in rows
+        if (r.external_ids or {}).get("the_odds_api_id") not in live_odds_ids
+    ]
+
+
 def find_or_create_event_for_odds(
-    conn: Connection, t: dict[str, Table], sport_id: uuid.UUID, ev: OddsEvent
-) -> tuple[uuid.UUID, bool]:
-    """Resolve an odds feed event to an events row; returns (event_id, created)."""
+    conn: Connection,
+    t: dict[str, Table],
+    sport_id: uuid.UUID,
+    ev: OddsEvent,
+    *,
+    live_odds_ids: frozenset[str] | None = None,
+) -> tuple[uuid.UUID, str]:
+    """Resolve an odds feed event to an events row; returns (event_id, action).
+
+    ``action`` is one of:
+      - ``"matched"``   — tier 1, exact ``the_odds_api_id`` hit.
+      - ``"merged"``    — tier 2, id-less schedule event adopted the odds id.
+      - ``"restamped"`` — tier 2.5, an event whose stored id vanished from the
+        current feed cycle had its id replaced (see module docstring).
+      - ``"created"``   — tier 3, brand-new event row.
+      - ``"created_ambiguous"`` — tier 2.5 found >1 superseded candidate
+        (identical-start doubleheader edge) and refused to guess; a new row
+        was created and the conflict logged for the audit to surface.
+
+    ``live_odds_ids`` is the set of every event id in the current feed
+    payload; ``None`` (non-cycle callers) skips tier 2.5 entirely.
+    """
     events = t["events"]
     row = conn.execute(
         select(events.c.id).where(
@@ -228,10 +345,54 @@ def find_or_create_event_for_odds(
         )
     ).first()
     if row is not None:
-        return row.id, False
+        return row.id, "matched"
 
-    home_id = get_or_create_team(conn, t, sport_id, ev.home_team)
-    away_id = get_or_create_team(conn, t, sport_id, ev.away_team)
+    home_id = get_or_create_team(conn, t, sport_id, ev.home_team, from_odds_feed=True)
+    away_id = get_or_create_team(conn, t, sport_id, ev.away_team, from_odds_feed=True)
+
+    # Tier 2.5 runs BEFORE tier 2: a same-pair event ≤ RESTAMP_WINDOW away
+    # whose stored id just vanished from the feed is near-certain evidence of
+    # an id reissue — strictly stronger than an id-less row up to 3 h away.
+    # With tier 2 first, a reissue on a doubleheader day whose OTHER leg is
+    # still unpriced would merge the reissued id onto that id-less leg,
+    # silently appending leg 1's lines to leg 2 (adversarial-review find,
+    # 2026-07-20) — worse than the fragmentation this tier exists to stop.
+    created_action = "created"
+    if live_odds_ids is not None:
+        stale = _find_restampable_events(
+            conn, t, sport_id, home_id, away_id, ev.commence_time, live_odds_ids
+        )
+        if len(stale) == 1:
+            target = stale[0]
+            conn.execute(
+                update(events)
+                .where(events.c.id == target.id)
+                .values(
+                    # Only the odds identity changes: mlb_game_pk survives and
+                    # start_time_utc stays MLB-authoritative (sync_schedule
+                    # owns it; the reissued commence_time may drift ±1 min).
+                    external_ids={
+                        **(target.external_ids or {}),
+                        "the_odds_api_id": ev.source_id,
+                    }
+                )
+            )
+            return target.id, "restamped"
+        if len(stale) > 1:
+            # Identical-start doubleheader with BOTH legs superseded: any
+            # choice could clobber the wrong leg's identity, so refuse and
+            # fall through visibly instead of guessing.
+            logger.warning(
+                "restamp ambiguous: odds id %s (%s @ %s, %s) matches %d "
+                "superseded events %s; refusing to restamp",
+                ev.source_id,
+                ev.away_team,
+                ev.home_team,
+                ev.commence_time.isoformat(),
+                len(stale),
+                [str(r.id) for r in stale],
+            )
+            created_action = "created_ambiguous"
 
     match = _find_event_by_teams(
         conn, t, sport_id, home_id, away_id, ev.commence_time, "the_odds_api_id"
@@ -244,7 +405,7 @@ def find_or_create_event_for_odds(
                 external_ids={**(match.external_ids or {}), "the_odds_api_id": ev.source_id}
             )
         )
-        return match.id, False
+        return match.id, "merged"
 
     new_id = conn.execute(
         events.insert()
@@ -258,7 +419,7 @@ def find_or_create_event_for_odds(
         )
         .returning(events.c.id)
     ).scalar_one()
-    return new_id, True
+    return new_id, created_action
 
 
 def upsert_event_result(

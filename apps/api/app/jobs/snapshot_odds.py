@@ -86,12 +86,19 @@ def run(
         "events_in_feed": len(payload),
         "events_matched": 0,
         "events_created": 0,
+        "events_restamped": 0,
+        "restamp_ambiguous": [],
         "events_started_skipped": 0,
         "snapshots_inserted": 0,
         "f5_events_fetched": 0,
         "f5_errors": [],
         "outcomes_skipped": [],
     }
+
+    # Every id in this cycle's payload (started events included): tier 2.5
+    # treats an id absent from this set as superseded by The Odds API's
+    # reissue, and one still present as a live, distinct game.
+    live_ids = frozenset(str(raw["id"]) for raw in payload)
 
     with engine.begin() as conn:
         sport_id = store.get_sport_id(conn, tables)
@@ -105,10 +112,24 @@ def run(
                 ev = _with_f5(ev, client, summary)
             if not ev.outcomes:
                 continue
-            event_id, created = store.find_or_create_event_for_odds(
-                conn, tables, sport_id, ev
+            event_id, action = store.find_or_create_event_for_odds(
+                conn, tables, sport_id, ev, live_odds_ids=live_ids
             )
-            summary["events_created" if created else "events_matched"] += 1
+            if action in ("created", "created_ambiguous"):
+                summary["events_created"] += 1
+                if action == "created_ambiguous":
+                    summary["restamp_ambiguous"].append(
+                        {
+                            "source_id": ev.source_id,
+                            "home": ev.home_team,
+                            "away": ev.away_team,
+                            "commence_time": ev.commence_time.isoformat(),
+                        }
+                    )
+            else:
+                summary["events_matched"] += 1
+                if action == "restamped":
+                    summary["events_restamped"] += 1
             is_closing = (
                 closing_window_min is not None
                 and ev.commence_time <= captured_at + timedelta(minutes=closing_window_min)
