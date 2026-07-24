@@ -434,3 +434,39 @@ def test_manual_mode_guards_reject_bad_input(db):
     # A non-orphan target (has mlb_game_pk) is refused.
     with pytest.raises(ValueError, match="not an orphan"):
         repair_orphan_events.run(engine=db, orphan_id=str(sib_id), sibling_pk="824816")
+
+
+def test_clean_run_is_noop_and_leaves_guard_armed(db):
+    """The property that makes a DAILY auto schedule safe: with no repairable
+    orphan, run() is a no-op that NEVER disables the immutability trigger.
+    Seed a plain priced game (no orphan twin), run auto, assert nothing moved
+    AND the append-only guard is still armed (an UPDATE must still raise)."""
+    tables = store.reflect_tables(db)
+    with db.begin() as conn:
+        sport_id = store.get_sport_id(conn, tables)
+        ev_id = _seed_mlb_event(
+            conn, tables, sport_id, 824816, "Baltimore Orioles", "Chicago Cubs",
+            _utc(9, 17, 35),
+        )
+        store.insert_odds_snapshots(
+            conn, tables, ev_id, (_outcome("home"), _outcome("away")), _utc(9, 15, 23)
+        )
+
+    summary = repair_orphan_events.run(engine=db)
+    assert summary["mode"] == "auto"
+    assert summary["repointable"] == 0
+    assert summary["snapshots_repointed"] == 0
+    assert summary["events_deleted"] == 0
+    assert summary["repaired"] == []
+    # The snapshot is untouched.
+    assert (
+        _scalar(db, "SELECT count(*) FROM odds_snapshots WHERE event_id = :id", id=ev_id)
+        == 2
+    )
+    # Trigger never came off: the archive is still append-only.
+    with pytest.raises(DBAPIError, match="append-only"):
+        with db.begin() as conn:
+            conn.execute(
+                text("UPDATE odds_snapshots SET is_closing = true WHERE event_id = :id"),
+                {"id": ev_id},
+            )

@@ -147,6 +147,15 @@ jobs:
             python -m app.jobs.backfill_results --start-date "$START" --end-date "$YDAY"
             python -m app.jobs.backfill_pitching --start-date "$START" --end-date "$YDAY"
             python -m app.jobs.sync_transactions --start-date "$START" --end-date "$YDAY"
+            # Red de seguridad ANTES del audit: reconecta los huérfanos que la
+            # fuga residual del tier-2.5 (The Odds API lista el id viejo y el
+            # reemitido a la vez → el viejo no está superseded → no re-sella)
+            # deje escapar, para que el audit solo se ponga rojo por lo que sí
+            # necesita un humano (sin-sibling / ambiguo). Idempotente; en día
+            # limpio es no-op que ni levanta el trigger de inmutabilidad (solo
+            # lo toca si hay un huérfano con sibling único en ventana). Un
+            # huérfano que se cuele se cierra en ≤24h sin intervención.
+            python -m app.jobs.repair_orphan_events
             # El audit usa el MISMO lookback de 3 días que los backfills: la
             # detección (huecos, huérfanos de identidad) es one-shot sobre la
             # ventana auditada, y un cron diario saltado por GitHub dejaría el
